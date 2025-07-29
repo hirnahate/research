@@ -180,6 +180,102 @@ namespace intr::atomic:
     T exchSystem(T* addr, T value):
         // Atomic exchange, returns previous value
 
+/*
+#ifndef HARMONIZE_ATOMIC
+#define HARMONIZE_ATOMIC
+
+
+namespace atomic {
+
+
+template<typename T>
+__host__ __device__ T add_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicAdd_system(adr,val);
+    #else
+        return __sync_fetch_and_add(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T sub_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicSub_system(adr,val);
+    #else
+        return __sync_fetch_and_sub(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T and_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicAnd_system(adr,val);
+    #else
+        return __sync_fetch_and_and(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T or_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicOr_system(adr,val);
+    #else
+        return __sync_fetch_and_or(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T xor_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicXor_system(adr,val);
+    #else
+        return __sync_fetch_and_xor(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T min_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicMin_system(adr,val);
+    #else
+        return __sync_fetch_and_min(adr,val);
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T exch_system(T* adr,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicExch_system(adr,val);
+    #else
+        T result;
+        __atomic_exchange(adr,&val,&result,__ATOMIC_ACQ_REL);
+        return result;
+    #endif
+}
+
+template<typename T>
+__host__ __device__ T CAS_system(T* adr,T comp,T val) {
+    #ifdef __CUDA_ARCH__
+        return atomicCAS_system(adr,comp,val);
+    #else
+        bool success = false;
+        T expected = comp;
+        while ((!success) && (comp == expected)) {
+            success = __atomic_compare_exchange(adr,&expected,&val,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQ_REL);
+        }
+        return expected;
+    #endif
+}
+
+
+};
+
+
+
+
+#endif
+*/
+
 namespace intr::bitwise:
     int populationCount(T value):
         // Count number of set bits
@@ -189,6 +285,74 @@ namespace intr::bitwise:
     
     int leadingZeros(T value):
         // Count leading zero bits
+
+/*
+#ifndef HARMONIZE_BITWISE
+#define HARMONIZE_BITWISE
+
+
+
+namespace bitwise {
+
+
+size_t population_count(unsigned int val) {
+    #ifdef __CUDA_ARCH__
+        return __popc(val);
+    #else
+        return __builtin_popcount(val);
+    #endif
+}
+
+size_t population_count(unsigned long long int val) {
+    #ifdef __CUDA_ARCH__
+        return __popcll(val);
+    #else
+        return __builtin_popcountll(val);
+    #endif
+}
+
+
+size_t leading_zeros(unsigned int val) {
+    #ifdef __CUDA_ARCH__
+        return __clz(val);
+    #else
+        return __builtin_clz(val);
+    #endif
+}
+
+
+size_t leading_zeros(unsigned long long int val) {
+    #ifdef __CUDA_ARCH__
+        return __clzll(val);
+    #else
+        return __builtin_clzll(val);
+    #endif
+}
+
+
+size_t first_set(unsigned int val) {
+    #ifdef __CUDA_ARCH__
+        return __ffs(val);
+    #else
+        return __builtin_ffs(val);
+    #endif
+}
+
+
+size_t first_set(unsigned long long int val) {
+    #ifdef __CUDA_ARCH__
+        return __ffsll(val);
+    #else
+        return __builtin_ffsll(val);
+    #endif
+}
+
+
+}
+
+
+#endif
+*/
 
 
         

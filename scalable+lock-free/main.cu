@@ -199,8 +199,8 @@ void performanceTest() {
 }
 
 int main() {
-    std::cout << "Slab Allocator Test Suite" << std::endl;
-    std::cout << "=========================" << std::endl << std::endl;
+    std::cout << "Slab Allocator Test" << std::endl;
+    std::cout << "===================" << std::endl << std::endl;
     
     try {
         testBasicAllocation();

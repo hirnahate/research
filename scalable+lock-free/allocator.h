@@ -1,418 +1,245 @@
-#pragma once
-#include "intr/mod.h"
-#include <cstddef>
-#include <cstdint>
-//#include <device_launch_parameters.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
 
-#ifdef __CUDACC__
-    #include <cuda_runtime.h>
-    #include <device_launch_parameters.h>
-#else
-    #define __host__
-    #define __device__
-#endif
+#include "allocator.h"
 
-typedef unsigned long long int defaultAllocMaskElem;
-typedef unsigned long long int defaultSlabAddr;
-
-const size_t DEFAULT_SLAB_SIZE = 1 << 16;
-
-template <size_t n>
-struct Size {
-    static const size_t VALUE = n;
-};
-
-template <typename type>
-struct AdrInfo {
-    __host__ __device__
-    static type null(){
-        return static_cast<type>(-1);
-    }
-};
-
-
-// basic slab structure
-template <size_t SLAB_SIZE = DEFAULT_SLAB_SIZE, typename ELEM_TYPE = defaultAllocMaskElem>
-struct Slab {
-    typedef ELEM_TYPE allocMaskElem;
-
-    static const size_t ELEM_SIZE = sizeof(ELEM_TYPE);
-    static const size_t SIZE = SLAB_SIZE;
-    static const size_t ELEM_COUNT = (SLAB_SIZE + ELEM_SIZE - 1) / ELEM_SIZE;
-
-    ELEM_TYPE data[ELEM_COUNT];
-}; 
-
-// slab proxy  
-template <typename SLAB_TYPE>
-struct defaultSlabProxy {
-    typedef SLAB_TYPE slabType;
-    typedef typename SLAB_TYPE::allocMaskElem allocMaskElem;
-    typedef unsigned long long int AllocState;
-
-    static const AllocState OFFSET = sizeof(AllocState) * 8 / 2;
-    static const AllocState COUNT_MASK = (((AllocState)1) << OFFSET) - (AllocState)1;
-    static const AllocState SIZE_MASK = ~COUNT_MASK;
+// Test function
+void testBasicAllocation() {
+    std::cout << "=== Basic Allocation Test ===" << std::endl;
     
-    static const size_t SLAB_SIZE = SLAB_TYPE::SIZE;
-    static const size_t SLAB_ELEM_COUNT = SLAB_TYPE::ELEM_COUNT;
-    static const size_t SLAB_ELEM_BIT_SIZE = sizeof(allocMaskElem) * 8;         // check sizeof
-
-    allocMaskElem allocMask;
-    AllocState allocState;
-
-    __host__ __device__
-    size_t getSize()
-    { return (allocState & SIZE_MASK) >> OFFSET;}
-
-    __host__ __device__
-    bool bindSize(unsigned int newSize) {
-        allocMaskElem longSize = newSize;
-        allocMaskElem prev = intr::atomic::CAS_system(&allocState, 0ull, longSize << OFFSET);
-        return (prev == 0);
+    // Create arena and allocator
+    TestSlabArena arena;
+    TestAllocator allocator(arena, 64); // 64-byte objects
+    
+    std::cout << "Arena created, slab count: " << TestSlabArena::SLAB_COUNT << std::endl;
+    std::cout << "Slab size: " << TestSlabArena::slabType::SIZE << " bytes" << std::endl;
+    
+    // Test allocation
+    void* ptr1 = allocator.alloc();
+    if (ptr1) {
+        std::cout << "\nFirst allocation successful: " << ptr1 << std::endl;
+    } else {
+        std::cout << "\n:( - First allocation failed!" << std::endl;
+        return;
     }
-
-    __host__ __device__
-    bool clearAllocState(){
-        if(allocState == 0)
-            return false;
+    
+    void* ptr2 = allocator.alloc();
+    if (ptr2) {
+        std::cout << "Second allocation successful: " << ptr2 << std::endl;
+    } else {
+        std::cout << ":( - Second allocation failed!" << std::endl;
+    }
+    
+    // Test that pointers are different
+    if (ptr1 != ptr2) {
+        std::cout << "\nAllocated different addresses" << std::endl;
+    } else {
+        std::cout << "\n:( - Same address allocated twice!" << std::endl;
+    }
+    
+    // Test writing to allocated memory
+    if (ptr1) {
+        char* charPtr = static_cast<char*>(ptr1);
+        for (int i = 0; i < 64; i++) {
+            charPtr[i] = (char)(i % 256);
+        }
+        std::cout << "Successfully wrote to allocated memory" << std::endl;
         
-        allocMaskElem prev = intr::atomic::exch_system(&allocState, 0ull);
-        return ((prev & SIZE_MASK) != 0) && ((prev & COUNT_MASK) == 0);
-    }
-
-    __host__ __device__
-    size_t slabObjCountNoMask(size_t objectSize)
-    { return SLAB_SIZE / objectSize;}
-
-    __host__ __device__
-    size_t slabObjCountWithMask(size_t objectSize){
-        size_t objectBitSize = objectSize * 8;
-        size_t bitCostPerObj = (objectBitSize + 1);
-        size_t totalBits = SLAB_ELEM_COUNT + SLAB_ELEM_BIT_SIZE;
-        size_t idealTOBC = (totalBits * objectBitSize) / bitCostPerObj;     // total object bit count
-        size_t maxExcluTOBC = (idealTOBC / SLAB_ELEM_BIT_SIZE) * SLAB_ELEM_BIT_SIZE;
-
-        size_t objectCount = maxExcluTOBC / objectBitSize;
-        return objectCount;
-    }
-
-    __host__ __device__
-    size_t slabObjCount(size_t objectSize){
-        size_t result = slabObjCountNoMask(objectSize);
-        if(result > 64)
-            result = slabObjCountWithMask(objectSize);
-
-        return result;
-    }
-
-    __host__ __device__
-    void clearSlab(SLAB_TYPE* slab, size_t maskElemCount){
-        for(size_t i = 0; i < maskElemCount; i++)
-            slab->data[i] = 0;
-    }
-
-    __host__ __device__
-    bool claim(SLAB_TYPE* slab, size_t objectSize){
-        AllocState startingState = ((AllocState)objectSize) << OFFSET;
-
-        if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
-            return false;
-
-        size_t objectCount = slabObjCount(objectSize);
-        if(objectCount == 0)
-            return false;
-
-        allocMask = 0;
-        if(objectCount > SLAB_ELEM_BIT_SIZE){
-            size_t maskElemCount = (objectCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
-            clearSlab(slab, maskElemCount);
+        // Verify the data
+        bool dataOk = true;
+        for (int i = 0; i < 64; i++) {
+            if (charPtr[i] != (char)(i % 256)) {
+                dataOk = false;
+                break;
+            }
         }
-
-        return true;
-    }
-
-    __host__ __device__
-    bool attemptMaskAlloc(allocMaskElem& elem, size_t& result){
-        allocMaskElem maskCopy = allocMask;
-
-        while(intr::bitwise::population_count(maskCopy) < SLAB_ELEM_BIT_SIZE){
-            size_t target = intr::bitwise::first_set(~maskCopy);
-            allocMaskElem targetMask = 1 << target;
-            maskCopy = intr::atomic::or_system(&allocMask, targetMask);
-
-            if((maskCopy & targetMask) == 0){
-                result = target;
-                return true;
-            }
-        } 
-
-        return false;
-    }
-
-    __host__ __device__
-    void* indexToPtr(SLAB_TYPE* slab, size_t objectSize, size_t maskElemCount, size_t ind){
-        char* bytePtr = static_cast<char*>(static_cast<void*>(slab));
-        bytePtr += sizeof(allocMaskElem) * maskElemCount;
-        bytePtr += objectSize * ind;
-
-        return static_cast<void*>(bytePtr);
-    }
-
-    __host__ __device__
-    void* alloc(SLAB_TYPE* slab, bool& slabFilled){
-        allocMaskElem prev = intr::atomic::add_system(&allocState, (allocMaskElem)1);
-
-        allocMaskElem prevCount = prev & COUNT_MASK;
-        allocMaskElem objectSize = (prev & SIZE_MASK) >> OFFSET;
-
-        allocMaskElem maxObjCount = slabObjCount(objectSize);
-        if(prevCount >= maxObjCount){
-            intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
-            return nullptr;
-        }        
-
-        slabFilled = (prevCount == (maxObjCount - 1));
-
-        size_t maskElemCount = (maxObjCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
-        if(maxObjCount <= SLAB_ELEM_BIT_SIZE){
-            size_t index;
-            if(attemptMaskAlloc(allocMask, index)){
-                return indexToPtr(slab, objectSize, maskElemCount, index);
-            } else {
-                return nullptr;
-            }
+        if (dataOk) {
+            std::cout << "Data integrity verified" << std::endl;
         } else {
-            for(size_t i = 0; i < 2048; i++){
-                for(size_t j = 0; j < SLAB_ELEM_COUNT; j++){
-                    size_t index;
-                    if(attemptMaskAlloc(slab->data[j], index)){
-                        size_t fullIndex = SLAB_ELEM_BIT_SIZE * j + index;
-                        return indexToPtr(slab, objectSize, maskElemCount, fullIndex);
-                    }
-                }
+            std::cout << "\n:( - Data corruption detected!" << std::endl;
+        }
+    }
+    
+    // Test freeing
+    if (allocator.free(ptr1)) {
+        std::cout << "\nptr1 freed successfully..." << std::endl;
+    } else {
+        std::cout << "\n:( - First free failed!" << std::endl;
+    }
+    
+    if (allocator.free(ptr2)) {
+        std::cout << "ptr2 freed successfully..." << std::endl;
+    } else {
+        std::cout << "\n:( - Second free failed!" << std::endl;
+    }
+    
+    std::cout << std::endl;
+} // end of basic
+
+bool testZeroSizeAllocation(){
+    std::cout << "=== Zero Size Allocation Test ===" << std::endl;
+
+    TestSlabArena arena;
+    TestAllocator allocator(arena, 0);
+
+    void* ptr = allocator.alloc();
+    std::cout << "Zero-size allocation returned: " << ptr << std::endl;
+
+    bool valid = allocator.isValidPtr(ptr);
+    if(valid){
+        std::cout << "Zero-sized allocation tracked successfully!" << std::endl;
+        bool freed = allocator.free(ptr);
+        if(freed)
+            std::cout << "Zero-size allocation should free successfully" << std::endl;
+    } else {
+        std::cout << ":( - Zero-sized allocation failed!!" << std::endl;
+    }   // is this ok?
+
+    return true;
+} // end of zero
+
+void testMultipleAllocations() {
+    std::cout << "\n=== Multiple Allocations Test ===" << std::endl;
+    
+    TestSlabArena arena;
+    TestAllocator allocator(arena, 32); // 32-byte objects
+    
+    const int numAllocs = 100;
+    std::vector<void*> ptrs;
+    
+    // Allocate multiple objects
+    for (int i = 0; i < numAllocs; i++) {
+        void* ptr = allocator.alloc();
+        if (ptr) {
+            ptrs.push_back(ptr);
+        } else {
+            std::cout << ":( - Allocation failed at iteration " << i << std::endl;
+            break;
+        }
+    }
+    
+    std::cout << "\nSuccessfully allocated " << ptrs.size() << " objects" << std::endl;
+    
+    // Verify all pointers are unique
+    bool allUnique = true;
+    for (size_t i = 0; i < ptrs.size() && allUnique; i++) {
+        for (size_t j = i + 1; j < ptrs.size(); j++) {
+            if (ptrs[i] == ptrs[j]) {
+                allUnique = false;
+                std::cout << ":( - Duplicate pointer found at indices " << i << " and " << j << std::endl;
+                break;
             }
-            return nullptr;
         }
-    } // end of alloc
-
-    __host__ __device__
-    bool free(SLAB_TYPE* slab, void* objPtr, bool& slabEmptied){
-        char* objBytePtr = static_cast<char*>(objPtr);
-        char* slabBytePtr = static_cast<char*>(static_cast<void*>(slab));
-        size_t byteOffset = objBytePtr - slabBytePtr;
-
-        allocMaskElem prev = intr::atomic::add_system(&allocState, ((AllocState)1) - ((AllocState)1));
-        allocMaskElem prevCount = prev & COUNT_MASK;
-
-        if(prevCount == 0){
-            intr::atomic::add_system(&allocState, 1ull);
-            return false;
+    }
+    
+    if (allUnique) {
+        std::cout << "All allocated pointers are unique" << std::endl;
+    }
+    
+    // Free all objects
+    int freedCount = 0;
+    for (void* ptr : ptrs) {
+        if (allocator.free(ptr)) {
+            freedCount++;
         }
+    }
+    
+    std::cout << "Successfully freed " << freedCount << "/" << ptrs.size() << " objects" << std::endl;
+    std::cout << std::endl;
+} // end of multi
 
-        slabEmptied = (prevCount == 1);
-
-        size_t objectSize = (prev & SIZE_MASK) >> OFFSET;
-        size_t maxObjCount = slabObjCount(objectSize);
-
-        size_t maskCount = (maxObjCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
-        size_t maskSize = maskCount * sizeof(allocMaskElem);
-        size_t firstObjOffset = maskSize;
-
-        size_t objOffset = byteOffset - firstObjOffset;
-        if(objOffset % objectSize != 0)
-            return false;
+void testDifferentSizes() {
+    std::cout << "=== Different Size Test ===" << std::endl;
+    
+    TestSlabArena arena;
+    
+    std::vector<size_t> sizes = {8, 16, 32, 64, 128, 256, 512, 1024};
+    
+    for (size_t size : sizes) {
+        TestAllocator allocator(arena, size);
+        void* ptr = allocator.alloc();
         
-        size_t objIndex = objOffset / objectSize;
-        if(objIndex >= maxObjCount)
-            return false;
-
-        size_t maskIndex = objIndex / SLAB_ELEM_BIT_SIZE;
-        size_t targetBit = objIndex % SLAB_ELEM_BIT_SIZE;
-        allocMaskElem targetMask = ((allocMaskElem)1) << ((allocMaskElem)targetBit);
-        allocMaskElem prevMask = 0;
-
-        if(maskCount <= 1){
-            prevMask = intr::atomic::or_system(&allocMask, ~targetMask);
-        } else {
-            prevMask = intr::atomic::or_system(&(slab->data[maskIndex]), ~targetMask);
-        }
-
-        return ((prevMask & targetMask) != 0);
-    } // end of free
-
-}; // end of slabProxy
-
-
-
-// node class
-template <typename Type, typename IndexType, typename SizeType>
-class Node{
-    public:
-        Type data;
-        IndexType next;
-        IndexType prev;
-
-        __host__ __device__
-        Node() :
-        next(AdrInfo<IndexType>::null()), prev(AdrInfo<IndexType>::null()) {}
-}; // end of Node
- 
-
-// direct arena class
-template <typename Type, typename IndexType, typename SizeType>
-class DirectArena {
-    public:
-        Type arena[SizeType::VALUE];
-
-        __host__ __device__
-        Type& at(IndexType index)
-        { return arena[index];}
-
-        __host__ __device__
-        const Type& at(IndexType index) const
-        { return arena[index];}
-
-        static constexpr size_t size()  
-        { return SizeType::VALUE; }
-}; // end of DirectArena
-
-// simple slab arena
-template <typename ARENA_SIZE, 
-          template<typename> typename SLAB_PROXY_TYPE = defaultSlabProxy,
-          typename SLAB_TYPE = Slab<DEFAULT_SLAB_SIZE>,
-          typename SLAB_ADDR_TYPE = defaultSlabAddr>
-class SlabArena {
-    public: 
-        typedef SLAB_ADDR_TYPE slabAddrType;
-        typedef SLAB_TYPE slabType;
-        typedef SLAB_PROXY_TYPE<SLAB_TYPE> slabProxyType;
-        typedef Node<slabProxyType, slabAddrType, Size<2>> proxyNodeType;
-
-        static const size_t SLAB_COUNT = (ARENA_SIZE::VALUE + SLAB_TYPE::SIZE - 1) / SLAB_TYPE::SIZE;
-
-        typedef DirectArena<slabType, slabAddrType, Size<SLAB_COUNT>> BackingArenaType;
-        typedef DirectArena<proxyNodeType, slabAddrType, Size<SLAB_COUNT>> ProxyArenaType;
-
-    private:
-        BackingArenaType slabs;
-        ProxyArenaType proxies;
-        slabAddrType nextFreeInd;
-
-    public:
-        __host__ __device__
-        SlabArena() : nextFreeInd(0){
-            for(size_t i = 0; i < SLAB_COUNT; i++){
-                proxies.arena[i].data.allocState = 0;
-                proxies.arena[i].data.allocMask = 0;
-            }
-        } 
-
-        __host__ __device__
-        slabAddrType slabIndexFor(void* ptr){
-            char* bytePtr = static_cast<char*>(ptr);
-            char* baseBytePtr = static_cast<char*>(static_cast<void*>(slabs.arena));
+        if (ptr) {
+            std::cout << "Size " << size << " bytes: allocation successful" << std::endl;
             
-            size_t ptrOffset = bytePtr - baseBytePtr;
-            size_t slabIndex = ptrOffset / SLAB_TYPE::SIZE;
-
-            return static_cast<slabAddrType>(slabIndex);
-        } // end of slabIndexFor
-
-        __host__ __device__
-        slabType& slabAt(slabAddrType slabIndex)
-        { return slabs.arena[slabIndex];}
-
-        __host__ __device__
-        proxyNodeType& proxyAt(slabAddrType slabIndex)
-        { return proxies.arena[slabIndex];}
-
-        __host__ __device__
-        slabType& slabFor(void* ptr){
-            slabAddrType slabIndex = slabIndexFor(ptr);
-            return slabs.arena[slabIndex];
-        }
-
-        __host__ __device__
-        proxyNodeType& proxyFor(void* ptr){
-            slabAddrType slabIndex = slabIndexFor(ptr);
-            return proxies.arena[slabIndex];
-        }
-
-        // first fit :)
-        __host__ __device__
-        slabAddrType alloc(){
-            for(size_t i = 0; i < SLAB_COUNT; i++){
-                if(proxies.arena[i].data.getSize() == 0)
-                    return static_cast<slabAddrType>(i);
+            // Test writing
+            char* charPtr = static_cast<char*>(ptr);
+            for (size_t i = 0; i < size; i++) {
+                charPtr[i] = (char)(i % 256);
             }
-            return AdrInfo<slabAddrType>::null();
-        } // end of alloc
+            
+            allocator.free(ptr);
+        } else {
+            std::cout << ":( - Size " << size << " bytes: allocation failed" << std::endl;
+        }
+    }
+    
+    std::cout << std::endl;
+} // end of diff
 
-        __host__ __device__
-        bool free(slabAddrType slabAddr){
-            if(slabAddr >= SLAB_COUNT)
-                return false;
-            return proxies.arena[slabAddr].data.clearAllocState();
-        } // end of free
-}; // end of SlabArena
+void performanceTest() {
+    std::cout << "=== Performance Test ===" << std::endl;
+    
+    TestSlabArena arena;
+    TestAllocator allocator(arena, 64);
+    
+    const int iterations = 10000;
+    std::vector<void*> ptrs;
+    ptrs.reserve(iterations);
+    
+    // Time allocations
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    for (int i = 0; i < iterations; i++) {
+        void* ptr = allocator.alloc();
+        if (ptr) {
+            ptrs.push_back(ptr);
+        } else {
+            break;
+        }
+    }
+    
+    auto mid = std::chrono::high_resolution_clock::now();
+    
+    // Time deallocations
+    for (void* ptr : ptrs) {
+        allocator.free(ptr);
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    auto allocTime = std::chrono::duration_cast<std::chrono::microseconds>(mid - start);
+    auto freeTime = std::chrono::duration_cast<std::chrono::microseconds>(end - mid);
+    
+    std::cout << "Allocated " << ptrs.size() << " objects in " << allocTime.count() << " μs" << std::endl;
+    std::cout << "Freed " << ptrs.size() << " objects in " << freeTime.count() << " μs" << std::endl;
+    std::cout << "\nAverage allocation time: " << (double)allocTime.count() / ptrs.size() << " μs" << std::endl;
+    std::cout << "Average free time: " << (double)freeTime.count() / ptrs.size() << " μs" << std::endl;
+    
+    std::cout << std::endl;
+} // end of perform
 
-// test allocator
-template <typename SLAB_ALLOCATOR_TYPE>
-class SimpleAllocator {
-    public:
-        typedef SLAB_ALLOCATOR_TYPE SlabAllocatorType;
-        typedef typename SlabAllocatorType::slabType SlabType;
-        typedef typename SlabAllocatorType::slabAddrType SlabAddrType;
-        typedef typename SlabAllocatorType::slabProxyType SlabProxyType;
-
-    private:
-        SlabAllocatorType& slabAllocator;
-        size_t objectSize;
-
-    public:
-        __host__ __device__
-        SimpleAllocator(SlabAllocatorType& slabAlloc, size_t objSize) :
-            slabAllocator(slabAlloc), objectSize(objSize) {}
+int main() {
+    std::cout << "Slab Allocator Test" << std::endl;
+    std::cout << "===================" << std::endl << std::endl;
+    
+    try {
+        testBasicAllocation();
+        testZeroSizeAllocation();
+        testMultipleAllocations();
+        testDifferentSizes();
+        performanceTest();
         
-        __host__ __device__
-        void* alloc(){
-            SlabAddrType slabAddr = slabAllocator.alloc();
-            if(slabAddr == AdrInfo<SlabAddrType>::null())
-                return nullptr;
-
-            SlabType& slab = slabAllocator.slabAt(slabAddr);
-            SlabProxyType& slabProxy = slabAllocator.proxyAt(slabAddr).data;
-
-            if(!slabProxy.claim(&slab, objectSize))
-                return nullptr;
-
-            bool slabFilled = false;
-            void* result = slabProxy.alloc(&slab, slabFilled);
-
-            return result;
-        } // end of alloc
-
-        __host__ __device__
-        bool free(void* ptr){
-            if(!ptr)
-                return false;
-
-            SlabAddrType slabAddr = slabAllocator.slabIndexFor(ptr);
-            SlabType& slab = slabAllocator.slabAt(slabAddr);
-            SlabProxyType& slabProxy = slabAllocator.proxyAt(slabAddr).data;
-
-            bool slabEmptied = false;
-            if(!slabProxy.free(&slab, ptr, slabEmptied))
-                return false;
-
-            if(slabEmptied)
-                slabAllocator.free(slabAddr);
-
-            return true;
-        } // end of free
-}; // end of simpleAlloc
-
-// Type definitions for easy use
-typedef SlabArena<Size<1024*1024>> TestSlabArena; // 1MB arena
-typedef SimpleAllocator<TestSlabArena> TestAllocator;
+        std::cout << "All tests completed! Exiting..." << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "Unknown exception caught!" << std::endl;
+        return 1;
+    }
+    
+    return 0;
+} // end of main

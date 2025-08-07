@@ -15,7 +15,7 @@
 typedef unsigned long long int defaultAllocMaskElem;
 typedef unsigned long long int defaultSlabAddr;
 
-const size_t DEFAULT_SLAB_SIZE = 1 << 16;
+const size_t DEFAULT_SLAB_SIZE = 1 << 16;       // 64KB
 
 template <size_t n>
 struct Size {
@@ -66,8 +66,26 @@ struct defaultSlabProxy {
     { return (allocState & SIZE_MASK) >> OFFSET;}
 
     __host__ __device__
+    size_t getCount()
+    { return (allocState & COUNT_MASK);}
+
+    __host__ __device__
+    size_t isEmpty()
+    { return getCount() == 0; }
+
+    __host__ __device__
+    bool isFull(){
+        size_t objSize = getSize();
+        if(objSize == 0)
+            return false;
+
+        return (getCount() >= slabObjCount(objSize));
+    } // end of isFull
+
+    // IS THIS REALLY NECESSARY
+    __host__ __device__
     bool bindSize(unsigned int newSize) {
-        allocMaskElem longSize = newSize;
+        allocMaskElem longSize = newSize;            
         allocMaskElem prev = intr::atomic::CAS_system(&allocState, 0ull, longSize << OFFSET);
         return (prev == 0);
     }
@@ -100,7 +118,7 @@ struct defaultSlabProxy {
     __host__ __device__
     size_t slabObjCount(size_t objectSize){
         if(objectSize <= 0)
-            return 1;           // min allocation size?
+            return (size_t)nullptr;           // min allocation size? NULLPTR
 
         size_t result = slabObjCountNoMask(objectSize);
         if(result > 64)
@@ -118,25 +136,39 @@ struct defaultSlabProxy {
     __host__ __device__
     bool claim(SLAB_TYPE* slab, size_t objectSize){
         if(objectSize <= 0)
-            return false;
+            return false;           // nullptr?
 
         AllocState startingState = ((AllocState)objectSize) << OFFSET;
+        AllocState currentState = allocState;
 
-        if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
-            return false;
+        // new slab
+        if(currentState == 0) {
+            if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
+                return false;
 
-        size_t objectCount = slabObjCount(objectSize);
-        if(objectCount == 0)
-            return false;
+            size_t objectCount = slabObjCount(objectSize);
+            if(objectCount == 0)
+                return false;
 
-        allocMask = 0;
-        if(objectCount > SLAB_ELEM_BIT_SIZE){
-            size_t maskElemCount = (objectCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
-            clearSlab(slab, maskElemCount);
+            allocMask = 0;          
+            if(objectCount > SLAB_ELEM_BIT_SIZE){
+                size_t maskElemCount = (objectCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
+                clearSlab(slab, maskElemCount);
+            }
+
+            return true;
         }
 
-        return true;
-    }
+        // empty slab with same objSz
+        size_t currentSize = (currentState & SIZE_MASK) >> OFFSET;
+        size_t currentCount = currentState & COUNT_MASK;
+
+        // check slab is ready for objSz+free
+        if(currentSize == objectSize && currentCount == 0)
+            return true;        
+        
+        return false;
+    } // end of claim
 
     __host__ __device__
     bool attemptMaskAlloc(allocMaskElem& elem, size_t& result){
@@ -154,7 +186,7 @@ struct defaultSlabProxy {
         } 
 
         return false;
-    }
+    } // end of attempt
 
     __host__ __device__
     void* indexToPtr(SLAB_TYPE* slab, size_t objectSize, size_t maskElemCount, size_t ind){
@@ -163,7 +195,7 @@ struct defaultSlabProxy {
         bytePtr += objectSize * ind;
 
         return static_cast<void*>(bytePtr);
-    }
+    } // end
 
     __host__ __device__
     void* alloc(SLAB_TYPE* slab, bool& slabFilled){
@@ -303,11 +335,10 @@ class SlabArena {
     private:
         BackingArenaType slabs;
         ProxyArenaType proxies;
-        slabAddrType nextFreeInd;
 
     public:
         __host__ __device__
-        SlabArena() : nextFreeInd(0){
+        SlabArena() {
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 proxies.arena[i].data.allocState = 0;
                 proxies.arena[i].data.allocMask = 0;
@@ -360,15 +391,35 @@ class SlabArena {
             return proxies.arena[slabIndex];
         }
 
-        // first fit :)
+        // first fit :) + reuse
         __host__ __device__
-        slabAddrType alloc(){
-            for(size_t i = 0; i < SLAB_COUNT; i++){
-                if(proxies.arena[i].data.getSize() == 0)
-                    return static_cast<slabAddrType>(i);
+        slabAddrType alloc(size_t objectSize = 0){
+            slabAddrType bestFit = AdrInfo<slabAddrType>::null();
+
+            // check for empty slabs of same size
+            if(objectSize > 0){
+                for(size_t i = 0; i < SLAB_COUNT; i++){
+                    slabProxyType& proxy = proxies.arena[i].data;
+                    if(proxy.getSize() == objectSize && proxy.isEmpty())
+                        return static_cast<slabAddrType>(i);
+                }
             }
-            return AdrInfo<slabAddrType>::null();
+
+            // check for free slabs
+            for(size_t i = 0; i < SLAB_COUNT; i++){
+                if(proxies.arena[i].data.getSize() == 0){
+                    if(bestFit == AdrInfo<slabAddrType>::null())
+                        bestFit = static_cast<slabAddrType>(i);
+                }
+            }
+            
+            return bestFit;
         } // end of alloc
+
+        // IS THIS NEEDED
+        __host__ __device__
+        slabAddrType allocForSize(size_t objSize)
+        { return alloc(objSize);}
 
         __host__ __device__
         bool free(slabAddrType slabAddr){
@@ -376,6 +427,24 @@ class SlabArena {
                 return false;
             return proxies.arena[slabAddr].data.clearAllocState();
         } // end of free
+
+        __host__ __device__
+        void getStats(size_t& totalSlabs, size_t& usedSlabs, size_t& emptyResusables){
+            totalSlabs = SLAB_COUNT;
+            usedSlabs = 0;
+            emptyResusables = 0;
+
+            for(size_t i = 0; i < SLAB_COUNT; i++){
+                slabProxyType& proxy = proxies.arena[i].data;
+                if(proxy.getSize() > 0){
+                    if(proxy.isEmpty()){
+                        emptyResusables++;
+                    } else {
+                        usedSlabs++;
+                    }
+                }
+            }
+        } // end of getStats
 }; // end of SlabArena
 
 // test allocator
@@ -416,11 +485,34 @@ class SimpleAllocator {
             }
             
             return totalCount;
-        }
+        } // end of getCount
+
+        __host__ __device__
+        void getReuseStats(size_t& activeSlabs, size_t& reusableSlabs, size_t& totalObjects){
+            activeSlabs = 0;
+            reusableSlabs = 0;
+            totalObjects = 0;
+
+            for(size_t i = 0; i < SlabAllocatorType::SLAB_COUNT; i++){
+                SlabProxyType& slabProxy = slabAllocator.proxyAt(static_cast<SlabAddrType>(i)).data;
+
+                if(slabProxy.getSize() == objectSize){
+                    size_t count = slabProxy.getCount();
+                    totalObjects += count;
+
+                    if(count > 0){
+                        activeSlabs++;
+                    } else {
+                        reusableSlabs++;
+                    }
+                }
+                    
+            }
+        } // end of getReuse
         
         __host__ __device__
         void* alloc(){
-            SlabAddrType slabAddr = slabAllocator.alloc();
+            SlabAddrType slabAddr = slabAllocator.allocForSize(objectSize);
             if(slabAddr == AdrInfo<SlabAddrType>::null())
                 return nullptr;
 
@@ -448,9 +540,6 @@ class SimpleAllocator {
             bool slabEmptied = false;
             if(!slabProxy.free(&slab, ptr, slabEmptied))
                 return false;
-
-            if(slabEmptied)
-                slabAllocator.free(slabAddr);
 
             return true;
         } // end of free

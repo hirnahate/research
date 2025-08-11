@@ -79,10 +79,12 @@ struct defaultSlabProxy {
         if(objSize == 0)
             return false;
 
-        return (getCount() >= slabObjCount(objSize));
+        size_t currentCount = getCount();
+        size_t maxCount = slabObjCount(objSize);
+                
+        return (currentCount >= maxCount);
     } // end of isFull
 
-    // IS THIS REALLY NECESSARY
     __host__ __device__
     bool bindSize(unsigned int newSize) {
         allocMaskElem longSize = newSize;            
@@ -100,32 +102,27 @@ struct defaultSlabProxy {
     }
 
     __host__ __device__
-    size_t slabObjCountNoMask(size_t objectSize)
-    { return SLAB_SIZE / objectSize;}
-
-    __host__ __device__
-    size_t slabObjCountWithMask(size_t objectSize){
-        size_t objectBitSize = objectSize * 8;
-        size_t bitCostPerObj = (objectBitSize + 1);
-        size_t totalBits = SLAB_ELEM_COUNT + SLAB_ELEM_BIT_SIZE;
-        size_t idealTOBC = (totalBits * objectBitSize) / bitCostPerObj;     // total object bit count
-        size_t maxExcluTOBC = (idealTOBC / SLAB_ELEM_BIT_SIZE) * SLAB_ELEM_BIT_SIZE;
-
-        size_t objectCount = maxExcluTOBC / objectBitSize;
-        return objectCount;
-    }
-
-    __host__ __device__
     size_t slabObjCount(size_t objectSize){
         if(objectSize <= 0)
-            return (size_t)nullptr;           // min allocation size? NULLPTR
+            return 0;           // lets say yes...
 
-        size_t result = slabObjCountNoMask(objectSize);
-        if(result > 64)
-            result = slabObjCountWithMask(objectSize);
+        // with mask...
+        size_t maxObjects = SLAB_SIZE / objectSize;
+        if(maxObjects <= SLAB_ELEM_BIT_SIZE)
+            return maxObjects;
+        
+        size_t maskElem = (maxObjects + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
+        size_t maskOverhead = maskElem * sizeof(allocMaskElem);
 
-        return result;
-    }
+        if(maskOverhead >= SLAB_SIZE)
+            return 0;
+
+        size_t openSlabs = SLAB_SIZE - maskOverhead;
+        size_t realObjs = openSlabs / objectSize;
+
+        return realObjs;
+    } // end of slabObjCount
+
 
     __host__ __device__
     void clearSlab(SLAB_TYPE* slab, size_t maskElemCount){
@@ -161,10 +158,9 @@ struct defaultSlabProxy {
 
         // empty slab with same objSz
         size_t currentSize = (currentState & SIZE_MASK) >> OFFSET;
-        size_t currentCount = currentState & COUNT_MASK;
 
         // check slab is ready for objSz+free
-        if(currentSize == objectSize && currentCount == 0)
+        if(currentSize == objectSize)
             return true;        
         
         return false;
@@ -172,18 +168,30 @@ struct defaultSlabProxy {
 
     __host__ __device__
     bool attemptMaskAlloc(allocMaskElem& elem, size_t& result){
-        allocMaskElem maskCopy = allocMask;
+        allocMaskElem maskCopy = elem;
 
-        while(intr::bitwise::population_count(maskCopy) < SLAB_ELEM_BIT_SIZE){
-            size_t target = intr::bitwise::first_set(~maskCopy);
-            allocMaskElem targetMask = 1 << target;
-            maskCopy = intr::atomic::or_system(&allocMask, targetMask);
+        for(size_t i = 0; i < SLAB_ELEM_BIT_SIZE; i++){
+            size_t target = 0;
+            allocMaskElem temp = ~maskCopy;
+            if(temp == 0)
+                return false;
 
-            if((maskCopy & targetMask) == 0){
+            while((temp & 1) == 0){
+                temp >>= 1;
+                target++;
+                if(target >= SLAB_ELEM_BIT_SIZE)
+                    return false;
+            }
+            allocMaskElem targetMask = ((allocMaskElem)1) << target;
+            allocMaskElem prevMask = intr::atomic::or_system(&elem, targetMask);
+
+            if((prevMask & targetMask) == 0){
                 result = target;
                 return true;
             }
-        } 
+
+            maskCopy = prevMask | targetMask;
+        }
 
         return false;
     } // end of attempt
@@ -199,6 +207,7 @@ struct defaultSlabProxy {
 
     __host__ __device__
     void* alloc(SLAB_TYPE* slab, bool& slabFilled){
+        // ++
         allocMaskElem prev = intr::atomic::add_system(&allocState, (allocMaskElem)1);
 
         allocMaskElem prevCount = prev & COUNT_MASK;
@@ -206,6 +215,7 @@ struct defaultSlabProxy {
 
         allocMaskElem maxObjCount = slabObjCount(objectSize);
         if(prevCount >= maxObjCount){
+            // too many obj? --
             intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
             return nullptr;
         }        
@@ -218,20 +228,23 @@ struct defaultSlabProxy {
             if(attemptMaskAlloc(allocMask, index)){
                 return indexToPtr(slab, objectSize, maskElemCount, index);
             } else {
+                // failed to allo? --
+                intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
                 return nullptr;
             }
         } else {
-            for(size_t i = 0; i < 2048; i++){
-                for(size_t j = 0; j < SLAB_ELEM_COUNT; j++){
-                    size_t index;
-                    if(attemptMaskAlloc(slab->data[j], index)){
-                        size_t fullIndex = SLAB_ELEM_BIT_SIZE * j + index;
-                        return indexToPtr(slab, objectSize, maskElemCount, fullIndex);
-                    }
+            for(size_t i = 0; i < maskElemCount; i++){
+                size_t index;
+                if(attemptMaskAlloc(slab->data[i], index)){
+                    size_t fullIndex = SLAB_ELEM_BIT_SIZE * i + index;
+                    return indexToPtr(slab, objectSize, maskElemCount, fullIndex);
                 }
             }
-            return nullptr;
         }
+
+        // failed to allo? --
+        intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
+        return nullptr;
     } // end of alloc
 
     __host__ __device__
@@ -240,10 +253,12 @@ struct defaultSlabProxy {
         char* slabBytePtr = static_cast<char*>(static_cast<void*>(slab));
         size_t byteOffset = objBytePtr - slabBytePtr;
 
-        allocMaskElem prev = intr::atomic::add_system(&allocState, ((AllocState)1) - ((AllocState)1));
+        // --
+        allocMaskElem prev = intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
         allocMaskElem prevCount = prev & COUNT_MASK;
 
         if(prevCount == 0){
+            // nothing alloc-ed? ++
             intr::atomic::add_system(&allocState, 1ull);
             return false;
         }
@@ -258,12 +273,18 @@ struct defaultSlabProxy {
         size_t firstObjOffset = maskSize;
 
         size_t objOffset = byteOffset - firstObjOffset;
-        if(objOffset % objectSize != 0)
+        if(objOffset % objectSize != 0){
+            // invalid ptr? ++
+            intr::atomic::add_system(&allocState, 1ull);
             return false;
+        }
         
         size_t objIndex = objOffset / objectSize;
-        if(objIndex >= maxObjCount)
+        if(objIndex >= maxObjCount){
+            // invalid ind? ++
+            intr::atomic::add_system(&allocState, 1ull);
             return false;
+        }
 
         size_t maskIndex = objIndex / SLAB_ELEM_BIT_SIZE;
         size_t targetBit = objIndex % SLAB_ELEM_BIT_SIZE;
@@ -271,12 +292,18 @@ struct defaultSlabProxy {
         allocMaskElem prevMask = 0;
 
         if(maskCount <= 1){
-            prevMask = intr::atomic::or_system(&allocMask, ~targetMask);
+            prevMask = intr::atomic::and_system(&allocMask, ~targetMask);
         } else {
-            prevMask = intr::atomic::or_system(&(slab->data[maskIndex]), ~targetMask);
+            prevMask = intr::atomic::and_system(&(slab->data[maskIndex]), ~targetMask);
         }
 
-        return ((prevMask & targetMask) != 0);
+        // check
+        bool wasAllocated = ((prevMask & targetMask) != 0);
+        if(!wasAllocated)
+            // bit not set? ++
+            intr::atomic::add_system(&allocState, 1ull);
+
+        return wasAllocated;
     } // end of free
 
 }; // end of slabProxy
@@ -400,8 +427,9 @@ class SlabArena {
             if(objectSize > 0){
                 for(size_t i = 0; i < SLAB_COUNT; i++){
                     slabProxyType& proxy = proxies.arena[i].data;
-                    if(proxy.getSize() == objectSize && proxy.isEmpty())
+                    if(proxy.getSize() == objectSize && !proxy.isFull()){
                         return static_cast<slabAddrType>(i);
+                    }
                 }
             }
 
@@ -412,14 +440,9 @@ class SlabArena {
                         bestFit = static_cast<slabAddrType>(i);
                 }
             }
-            
+
             return bestFit;
         } // end of alloc
-
-        // IS THIS NEEDED
-        __host__ __device__
-        slabAddrType allocForSize(size_t objSize)
-        { return alloc(objSize);}
 
         __host__ __device__
         bool free(slabAddrType slabAddr){
@@ -463,7 +486,8 @@ class SimpleAllocator {
     public:
         __host__ __device__
         SimpleAllocator(SlabAllocatorType& slabAlloc, size_t objSize) :
-            slabAllocator(slabAlloc), objectSize(objSize) {}
+            slabAllocator(slabAlloc), objectSize(objSize == 0 ? 1 : objSize) {}
+
 
         __host__ __device__
         bool isValidPtr(void* ptr) {
@@ -504,15 +528,14 @@ class SimpleAllocator {
                         activeSlabs++;
                     } else {
                         reusableSlabs++;
-                    }
-                }
-                    
-            }
+                    } // else
+                } // outer if
+            } // for
         } // end of getReuse
         
         __host__ __device__
         void* alloc(){
-            SlabAddrType slabAddr = slabAllocator.allocForSize(objectSize);
+            SlabAddrType slabAddr = slabAllocator.alloc(objectSize);
             if(slabAddr == AdrInfo<SlabAddrType>::null())
                 return nullptr;
 
@@ -545,6 +568,6 @@ class SimpleAllocator {
         } // end of free
 }; // end of simpleAlloc
 
-// type definitions for easy use
-typedef SlabArena<Size<1024*1024>> TestSlabArena; // 1MB arena
+// smaller slabs!!
+typedef SlabArena<Size<1024*1024>, defaultSlabProxy, Slab<4096>> TestSlabArena; // 4KB slabs
 typedef SimpleAllocator<TestSlabArena> TestAllocator;

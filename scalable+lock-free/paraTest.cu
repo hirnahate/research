@@ -162,7 +162,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
                     uint32_t* intPtr = static_cast<uint32_t*>(ptr);
                     if ((*intPtr >> 16) != threadId) {
                         localErrors++;
-                        std::cout << "thread " << threadId << ": data corruption detected!" << std::endl;
+                        std::cout << "Thread " << threadId << ": data corruption detected!" << std::endl;
                     }
                 }
                 
@@ -197,13 +197,13 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
         }
     }
     
-    std::cout << "thread " << threadId << " done: " 
+    std::cout << "Thread " << threadId << " done: " 
               << localAllocs << " allocs, " << localFrees << " frees, " 
               << localErrors << " errors" << std::endl;
 }
 
 void testBasicParallel() {
-    std::cout << "=== basic parallel test ===" << std::endl;
+    std::cout << "=== Basic Parallel Test ===" << std::endl;
     
     TestSlabArena arena;
     ParallelTracker tracker;
@@ -235,19 +235,19 @@ void testBasicParallel() {
     size_t totalAllocs, totalFrees, totalFailures, totalLeaks;
     tracker.getStats(totalAllocs, totalFrees, totalFailures, totalLeaks);
     
-    std::cout << "\nresults:" << std::endl;
-    std::cout << "duration: " << duration.count() << "ms" << std::endl;
-    std::cout << "allocs: " << totalAllocs << std::endl;
-    std::cout << "frees: " << totalFrees << std::endl;
-    std::cout << "failures: " << totalFailures << std::endl;
-    std::cout << "leaks: " << totalLeaks << std::endl;
-    std::cout << "success rate: " << (100.0 * (totalAllocs + totalFrees)) / 
+    std::cout << "\nResults:" << std::endl;
+    std::cout << "Duration: " << duration.count() << "ms" << std::endl;
+    std::cout << "Allocs: " << totalAllocs << std::endl;
+    std::cout << "Frees: " << totalFrees << std::endl;
+    std::cout << "Failures: " << totalFailures << std::endl;
+    std::cout << "Leaks: " << totalLeaks << std::endl;
+    std::cout << "Success rate: " << (100.0 * (totalAllocs + totalFrees)) / 
                                       (totalAllocs + totalFrees + totalFailures) << "%" << std::endl;
     
     if (totalLeaks == 0) {
-        std::cout << "✓ no leaks" << std::endl;
+        std::cout << ":) no leaks" << std::endl;
     } else {
-        std::cout << "✗ leaks detected!" << std::endl;
+        std::cout << ":( leaks detected!" << std::endl;
     }
     
     std::cout << std::endl;
@@ -299,16 +299,16 @@ void testHighContentionParallel() {
               << " ops/sec" << std::endl;
     
     if (totalLeaks == 0) {
-        std::cout << "✓ no leaks under contention" << std::endl;
+        std::cout << ":) No leaks under contention" << std::endl;
     } else {
-        std::cout << "✗ leaks under contention!" << std::endl;
+        std::cout << ":( Leaks under contention!" << std::endl;
     }
     
     std::cout << std::endl;
 }
 
 void testStressTest() {
-    std::cout << "=== stress test ===" << std::endl;
+    std::cout << "=== Stress Test ===" << std::endl;
     
     TestSlabArena arena;
     ParallelTracker tracker;
@@ -321,7 +321,7 @@ void testStressTest() {
     
     // run a few rounds
     for (int round = 0; round < 3; round++) {
-        std::cout << "round " << (round + 1) << std::endl;
+        std::cout << "Round " << (round + 1) << std::endl;
         tracker.reset();
         threads.clear();
         
@@ -343,34 +343,34 @@ void testStressTest() {
         size_t totalAllocs, totalFrees, totalFailures, totalLeaks;
         tracker.getStats(totalAllocs, totalFrees, totalFailures, totalLeaks);
         
-        std::cout << "  round " << (round + 1) << ": " << duration.count() << "ms, "
+        std::cout << "  Round " << (round + 1) << ": " << duration.count() << "ms, "
                   << totalAllocs << " allocs, " << totalFrees << " frees, "
                   << totalLeaks << " leaks" << std::endl;
     }
     
-    std::cout << "✓ stress test done!" << std::endl << std::endl;
+    std::cout << ":) Stress test done!" << std::endl << std::endl;
 }
 
 int main() {
-    std::cout << "parallel slab allocator test" << std::endl;
-    std::cout << "============================" << std::endl << std::endl;
+    std::cout << "Parallel Test" << std::endl;
+    std::cout << "==============" << std::endl << std::endl;
     
-    std::cout << "hardware concurrency: " << std::thread::hardware_concurrency() << " threads" << std::endl;
-    std::cout << "test slab arena size: " << TestSlabArena::SLAB_COUNT << " slabs" << std::endl;
-    std::cout << "slab size: " << TestSlabArena::slabType::SIZE << " bytes" << std::endl << std::endl;
+    std::cout << "Hardware concurrency: " << std::thread::hardware_concurrency() << " threads" << std::endl;
+    std::cout << "Test Slab Arena Size: " << TestSlabArena::SLAB_COUNT << " slabs" << std::endl;
+    std::cout << "Slab Size: " << TestSlabArena::slabType::SIZE << " bytes" << std::endl << std::endl;
     
     try {
         testBasicParallel();
         testHighContentionParallel();
         testStressTest();
         
-        std::cout << "all tests done!" << std::endl;
+        std::cout << "All tests done!" << std::endl;
         
     } catch (const std::exception& e) {
-        std::cerr << "exception: " << e.what() << std::endl;
+        std::cerr << "Exception: " << e.what() << std::endl;
         return 1;
     } catch (...) {
-        std::cerr << "unknown exception!" << std::endl;
+        std::cerr << "Unknown exception!" << std::endl;
         return 1;
     }
     

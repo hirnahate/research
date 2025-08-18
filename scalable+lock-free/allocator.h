@@ -143,6 +143,8 @@ struct defaultSlabProxy {
             if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
                 return false;
 
+            __sync_synchronize();
+
             size_t objectCount = slabObjCount(objectSize);
             if(objectCount == 0)
                 return false;
@@ -168,31 +170,26 @@ struct defaultSlabProxy {
 
     __host__ __device__
     bool attemptMaskAlloc(allocMaskElem& elem, size_t& result){
-        allocMaskElem maskCopy = elem;
-
-        for(size_t i = 0; i < SLAB_ELEM_BIT_SIZE; i++){
-            size_t target = 0;
-            allocMaskElem temp = ~maskCopy;
-            if(temp == 0)
-                return false;
-
-            while((temp & 1) == 0){
-                temp >>= 1;
-                target++;
-                if(target >= SLAB_ELEM_BIT_SIZE)
-                    return false;
-            }
-            allocMaskElem targetMask = ((allocMaskElem)1) << target;
-            allocMaskElem prevMask = intr::atomic::or_system(&elem, targetMask);
-
-            if((prevMask & targetMask) == 0){
+        for(size_t attempts = 0; attempts < SLAB_ELEM_BIT_SIZE; attempts++){
+            allocMaskElem currentMask = elem;
+            
+            // Find first free bit
+            allocMaskElem freeMask = ~currentMask;
+            if(freeMask == 0) return false;
+            
+            size_t target = __builtin_ctzll(freeMask); // Count trailing zeros
+            if(target >= SLAB_ELEM_BIT_SIZE) return false;
+            
+            allocMaskElem targetBit = ((allocMaskElem)1) << target;
+            allocMaskElem expected = currentMask;
+            
+            // Atomic compare-and-swap to claim the bit
+            if(intr::atomic::CAS_system(&elem, expected, currentMask | targetBit) == expected) {
                 result = target;
                 return true;
             }
-
-            maskCopy = prevMask | targetMask;
+            // CAS failed, retry with updated mask
         }
-
         return false;
     } // end of attempt
 

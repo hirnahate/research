@@ -143,7 +143,13 @@ struct defaultSlabProxy {
             if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
                 return false;
 
-            __sync_synchronize();
+            #if defined(__CUDA_ARCH__)
+            // device: ensure memory visibility system-wide (closest to __sync_synchronize)
+                __threadfence_system();
+            #else
+            // host: compiler builtin/full fence
+                __sync_synchronize();
+            #endif
 
             size_t objectCount = slabObjCount(objectSize);
             if(objectCount == 0)
@@ -177,7 +183,16 @@ struct defaultSlabProxy {
             allocMaskElem freeMask = ~currentMask;
             if(freeMask == 0) return false;
             
-            size_t target = __builtin_ctzll(freeMask); // Count trailing zeros
+            #if defined(__CUDA_ARCH__)
+                // CUDA device ~ use __ffsll (returns 1-based index of least-significant set bit)
+                int ff = __ffsll(static_cast<unsigned long long>(freeMask));
+                if(ff == 0) return false;
+                    size_t target = static_cast<size_t>(ff - 1);
+            #else
+                // host ~ use compiler builtin
+                size_t target = static_cast<size_t>(__builtin_ctzll(static_cast<unsigned long long>(freeMask)));
+            #endif
+
             if(target >= SLAB_ELEM_BIT_SIZE) return false;
             
             allocMaskElem targetBit = ((allocMaskElem)1) << target;

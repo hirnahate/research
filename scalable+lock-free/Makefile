@@ -2,7 +2,7 @@
 NVCC       := nvcc
 NVCC_FLAGS := -std=c++14 -arch=sm_80 -x=cu --forward-unknown-to-host-compiler
 
-all: main paraTest
+all: main.exe paraTest.exe
 
 main.exe: main.cu
 	$(NVCC) $(NVCC_FLAGS) $^ -o $@

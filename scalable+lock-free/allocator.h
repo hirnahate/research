@@ -566,5 +566,5 @@ class SimpleAllocator {
 }; // end of simpleAlloc
 
 // smaller slabs!!
-typedef SlabArena<Size<1024*1024>, defaultSlabProxy, Slab<4096>> TestSlabArena; // 4KB slabs
+typedef SlabArena<Size<1024*1024*1024>, defaultSlabProxy, Slab<4096>> TestSlabArena; // 4KB slabs
 typedef SimpleAllocator<TestSlabArena> TestAllocator;

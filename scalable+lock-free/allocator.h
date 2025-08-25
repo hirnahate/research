@@ -58,8 +58,16 @@ struct defaultSlabProxy {
     static const size_t SLAB_ELEM_COUNT = SLAB_TYPE::ELEM_COUNT;
     static const size_t SLAB_ELEM_BIT_SIZE = sizeof(allocMaskElem) * 8;         // check sizeof
 
+    enum SlabState : uint32_t   {
+        FREE = 0,
+        RESERVING = 1,
+        ACTIVE = 2,
+        FULL = 3
+    };
+
     allocMaskElem allocMask;
     AllocState allocState;
+    std::atomic<uint32_t> reservationState{FREE};
 
     __host__ __device__
     size_t getSize()
@@ -84,6 +92,35 @@ struct defaultSlabProxy {
                 
         return (currentCount >= maxCount);
     } // end of isFull
+    
+    __host__ __device__
+    bool isAvailable(){
+        uint32_t state = reservationState.load(std::memory_order_acquire);
+        return (state == ACTIVE && !isFull()) || state == FREE;
+    }
+
+    __host__ __device__
+    bool tryReserve(){
+        uint32_t expected = FREE;
+        // return intr::atomic::CAS_system();
+        return reservationState.compare_exchange_strong(
+            expected, RESERVING, std::memory_order_acq_rel);
+    }
+
+    __host__ __device__
+    bool confirmReservation(size_t objectSz){
+        if(bindSize(objectSz)){
+            reservationState.store(ACTIVE, std::memory_order_release);
+            return true;
+        }
+        reservationState.store(FREE, std::memory_order_release);
+        return false;
+    }
+
+    __host__ __device__
+    void releaseReservation(){
+        reservationState.store(FREE, std::memory_order_release);
+    }
 
     __host__ __device__
     bool bindSize(unsigned int newSize) {
@@ -98,7 +135,12 @@ struct defaultSlabProxy {
             return false;
         
         allocMaskElem prev = intr::atomic::exch_system(&allocState, 0ull);
-        return ((prev & SIZE_MASK) != 0) && ((prev & COUNT_MASK) == 0);
+        bool success = ((prev & SIZE_MASK) != 0) && ((prev & COUNT_MASK) = 0);
+
+        if(success)
+            reservationState.store(FREE, std::memory_order_release);
+
+        return success;
     }
 
     __host__ __device__
@@ -106,7 +148,6 @@ struct defaultSlabProxy {
         if(objectSize <= 0)
             return 0;           // lets say yes...
 
-        // with mask...
         size_t maxObjects = SLAB_SIZE / objectSize;
         if(maxObjects <= SLAB_ELEM_BIT_SIZE)
             return maxObjects;
@@ -135,43 +176,40 @@ struct defaultSlabProxy {
         if(objectSize <= 0)
             return false;           // nullptr?
 
-        AllocState startingState = ((AllocState)objectSize) << OFFSET;
         AllocState currentState = allocState;
 
-        // new slab
-        if(currentState == 0) {
-            if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
-                return false;
-
-            #if defined(__CUDA_ARCH__)
-            // device: ensure memory visibility system-wide (closest to __sync_synchronize)
-                __threadfence_system();
-            #else
-            // host: compiler builtin/full fence
-                __sync_synchronize();
-            #endif
-
-            size_t objectCount = slabObjCount(objectSize);
-            if(objectCount == 0)
-                return false;
-
-            allocMask = 0;          
-            if(objectCount > SLAB_ELEM_BIT_SIZE){
-                size_t maskElemCount = (objectCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
-                clearSlab(slab, maskElemCount);
-            }
-
-            return true;
+        // slabs w same size
+        if(currentState != 0) {
+            size_t currentSize = (currentState & SIZE_MASK) >> OFFSET;
+            return (currentSize == objectSize) 
+            && (reservationState.load(std::memory_order_acquire) == ACTIVE);
         }
 
-        // empty slab with same objSz
-        size_t currentSize = (currentState & SIZE_MASK) >> OFFSET;
+        // new slabs
+        if(reservationState.load() != RESERVING)
+            return false;
 
-        // check slab is ready for objSz+free
-        if(currentSize == objectSize)
-            return true;        
+        AllocState startingState = ((AllocState)objectSize) << OFFSET;
+        if(intr::atomic::CAS_system(&allocState, (AllocState)0, startingState) != 0)
+            return false;
+
+        #if defined(__CUDA_ARCH__)
+            __threadfence_system();
+        #else
+            __sync_synchronize();
+        #endif
+
+        size_t objectCount = slabObjCount(objectSize);
+        if(objectCount == 0)
+            return false;
         
-        return false;
+        allocMask = 0;
+        if(objectCount > SLAB_ELEM_BIT_SIZE){
+            size_t maskElemCount = (objectCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
+            clearSlab(slab, maskElemCount);
+        }
+
+        return true;
     } // end of claim
 
     __host__ __device__
@@ -276,6 +314,12 @@ struct defaultSlabProxy {
         }
 
         slabEmptied = (prevCount == 1);
+        if(slabEmptied){
+            reservationState.store(ACTIVE, std::memory_order_release);
+        } else if(reservationState.load() == FULL){
+            reservationState.store(ACTIVE, std::memory_order_release);
+        }
+
 
         size_t objectSize = (prev & SIZE_MASK) >> OFFSET;
         size_t maxObjCount = slabObjCount(objectSize);
@@ -374,6 +418,7 @@ class SlabArena {
     private:
         BackingArenaType slabs;
         ProxyArenaType proxies;
+        std::atomic<size_t> nextSearch{0};
 
     public:
         __host__ __device__
@@ -381,6 +426,7 @@ class SlabArena {
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 proxies.arena[i].data.allocState = 0;
                 proxies.arena[i].data.allocMask = 0;
+                proxies.arena[i].data.reservationState.store(slabProxyType::FREE, std::memory_order_relaxed);
             }
         } 
 
@@ -430,30 +476,35 @@ class SlabArena {
             return proxies.arena[slabIndex];
         }
 
-        // first fit :) + reuse
+        // round-robin :) + res
         __host__ __device__
         slabAddrType alloc(size_t objectSize = 0){
-            slabAddrType bestFit = AdrInfo<slabAddrType>::null();
-
-            // check for empty slabs of same size
-            if(objectSize > 0){
-                for(size_t i = 0; i < SLAB_COUNT; i++){
-                    slabProxyType& proxy = proxies.arena[i].data;
-                    if(proxy.getSize() == objectSize && !proxy.isFull()){
-                        return static_cast<slabAddrType>(i);
-                    }
-                }
-            }
-
-            // check for free slabs
+            if(objectSize == 0)
+                objectSize = 1;
+            
+            // look for slabs of size sz
             for(size_t i = 0; i < SLAB_COUNT; i++){
-                if(proxies.arena[i].data.getSize() == 0){
-                    if(bestFit == AdrInfo<slabAddrType>::null())
-                        bestFit = static_cast<slabAddrType>(i);
-                }
+                slabProxyType& proxy = proxies.arena[i].data;
+                if(proxy.getSize() == objectSize && 
+                proxy.reservationState.load(std::memory_order_acquire) == slabProxyType::ACTIVE 
+                && !proxy.isFull())
+                    return static_cast<slabAddrType>(i);
             }
 
-            return bestFit;
+            // try to res a free slab
+            size_t start = nextSearch.fetch_add(1, std::memory_order_relaxed) % SLAB_COUNT;
+            for(size_t offset = 0; offset < SLAB_COUNT; offset++){
+                size_t i = (start + offset) % SLAB_COUNT;
+                slabProxyType& proxy = proxies.arena[i].data;
+
+                if(proxy.reservationState.load(std::memory_order_acquire) == slabProxyType::FREE
+                && proxy.getSize() == 0){
+                    if(proxy.tryReserve())
+                        return static_cast<slabAddrType>(i);
+                }
+            }
+            
+            return slabAddrType(0);
         } // end of alloc
 
         __host__ __device__
@@ -556,6 +607,10 @@ class SimpleAllocator {
 
             if(!slabProxy.claim(&slab, objectSize))
                 return nullptr;
+
+            if(!slabProxy.confirmReservation(objectSize)) {
+                return nullptr;
+            }
 
             bool slabFilled = false;
             void* result = slabProxy.alloc(&slab, slabFilled);

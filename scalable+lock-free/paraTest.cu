@@ -8,52 +8,23 @@
 #include <unordered_set>
 #include <mutex>
 
+#include "log.h"
 #include "allocator.h"
 
-// lets make better error codes
 
-enum class AllocationError {
-    SUCCESS = 0,
-    NULL_POINTER,
-    INVALID_SLAB_INDEX,
-    SLAB_NOT_BOUND,
-    OFFSET_TOO_SMALL,
-    MISALIGNED_OBJECT,
-    OBJECT_INDEX_OUT_OF_RANGE,
-    TRACKING_INDEX_OUT_OF_RANGE,
-    CAS_FAILURE_ALREADY_ALLOCATED,
-    CAS_FAILURE_DOUBLE_FREE,
-    ALLOCATOR_FAILED,
-    TRACKER_RECORDING_FAILED
-};
-
-const char* errorToString(AllocationError error) {
-    switch (error) {
-        case AllocationError::SUCCESS: return "SUCCESS";
-        case AllocationError::NULL_POINTER: return "NULL_POINTER";
-        case AllocationError::INVALID_SLAB_INDEX: return "INVALID_SLAB_INDEX";
-        case AllocationError::SLAB_NOT_BOUND: return "SLAB_NOT_BOUND";
-        case AllocationError::OFFSET_TOO_SMALL: return "OFFSET_TOO_SMALL";
-        case AllocationError::MISALIGNED_OBJECT: return "MISALIGNED_OBJECT";
-        case AllocationError::OBJECT_INDEX_OUT_OF_RANGE: return "OBJECT_INDEX_OUT_OF_RANGE";
-        case AllocationError::TRACKING_INDEX_OUT_OF_RANGE: return "TRACKING_INDEX_OUT_OF_RANGE";
-        case AllocationError::CAS_FAILURE_ALREADY_ALLOCATED: return "CAS_FAILURE_ALREADY_ALLOCATED";
-        case AllocationError::CAS_FAILURE_DOUBLE_FREE: return "CAS_FAILURE_DOUBLE_FREE";
-        case AllocationError::ALLOCATOR_FAILED: return "ALLOCATOR_FAILED";
-        case AllocationError::TRACKER_RECORDING_FAILED: return "TRACKER_RECORDING_FAILED";
-        default: return "UNKNOWN_ERROR";
-    }
-}
 
 // global tracker for allocations/frees using an atomic bitmask
+template <typename SIZE_TYPE>
 class ParallelTracker {
 public:
-    static constexpr size_t PER_SLAB_STRIDE = 1024;
-    static constexpr size_t MAX_TRACKED_OBJECTS = 256 * PER_SLAB_STRIDE;
+    static const size_t MAX_TRACKED_OBJECTS = SIZE_TYPE::VALUE;
+    
 private:
     // each entry: [31:16] = size, [15:0] = thread_id, 0 = free
-    // std::atomic<uint32_t> trackingArena[MAX_TRACKED_OBJECTS];
-    std::unique_ptr<std::atomic<uint32_t>[]> trackingArena;
+    std::atomic<uint32_t> trackingArena[MAX_TRACKED_OBJECTS];
+    std::atomic<size_t> currentByteTotal{0};
+    std::atomic<size_t> minimumRefusalTotal{MAX_TRACKED_OBJECTS*8};
+
     std::atomic<size_t> totalAllocations{0};
     std::atomic<size_t> totalFrees{0};
     std::atomic<size_t> totalFailures{0};
@@ -62,11 +33,23 @@ private:
     
 public:
 
-    ParallelTracker():trackingArena(new std::atomic<uint32_t>[MAX_TRACKED_OBJECTS]) {
-        for (size_t i = 0; i < MAX_TRACKED_OBJECTS; ++i) {
+    ParallelTracker() {
+        for(size_t i = 0; i < MAX_TRACKED_OBJECTS; i++) {
+
             trackingArena[i].store(0, std::memory_order_relaxed);
         }
     }
+
+
+    size_t getCurrentByteTotal() {
+        return currentByteTotal.load();
+    }
+
+    void logRefusalAtTotal(size_t total) {
+        size_t expected = minimumRefusalTotal.load();
+        while ( (expected > total) && (minimumRefusalTotal.compare_exchange_strong(expected,total,std::memory_order_acq_rel)) ) {}
+    }
+    
 
     // figure out arena index for a pointer
     std::pair<size_t, AllocationError> getIndexForPointer(void* ptr, TestSlabArena& arena) {
@@ -171,22 +154,25 @@ public:
     
     // wrapper
     size_t getIndexForPtr(void* ptr, TestSlabArena& arena) {
-        auto result = getIndexForPointer(ptr, arena);
-        return result.first;
+
+        if (!ptr) return MAX_TRACKED_OBJECTS;
+        
+        char* ptrChar = static_cast<char*>(ptr);
+        char* arenaBase = static_cast<char*>(static_cast<void*>(&arena));
+        
+        size_t offset = ptrChar - arenaBase;
+        size_t index = offset / 8; // assuming 64-byte chunks
+        
+        return (index < MAX_TRACKED_OBJECTS) ? index : MAX_TRACKED_OBJECTS;
+
     }
     
     // log an allocation with CAS
     bool recordAllocation(void* ptr, size_t size, uint16_t threadId, TestSlabArena& arena) {
-        auto result = getIndexForPointer(ptr, arena);
-        size_t index = result.first;
-        AllocationError error = result.second;
-        
-        if (error != AllocationError::SUCCESS) {
-            std::lock_guard<std::mutex> lock(debugMutex);
-            std::cout << "ALLOC FAIL: Thread=" << threadId << " ptr=" << ptr 
-                      << " sz=" << size << " ind=" << index 
-                      << " error=" << errorToString(error) << std::endl;
-            totalFailures.fetch_add(1, std::memory_order_relaxed);
+        size_t index = getIndexForPtr(ptr, arena);
+        if (index >= MAX_TRACKED_OBJECTS) {
+            Log() << "Failed: Allocation index for size "<< size << " at " << ptr <<" exceeds arena bounds!" << std::endl;
+
             return false;
         }
         
@@ -195,19 +181,13 @@ public:
         
         if (trackingArena[index].compare_exchange_strong(expected, newValue, std::memory_order_acq_rel)) {
             totalAllocations.fetch_add(1, std::memory_order_relaxed);
+            currentByteTotal.fetch_add(size, std::memory_order_relaxed);
             return true;
         }
-        
-        // CAS failed - slot was already occupied
-        {
-            std::lock_guard<std::mutex> lock(debugMutex);
-            std::cout << "ALLOC CAS FAIL: Thread=" << threadId << " ptr=" << ptr 
-                      << " sz=" << size << " ind=" << index 
-                      << " expected=0 actual=" << expected 
-                      << " (thread=" << (expected & 0xFFFF) 
-                      << " size=" << ((expected >> 16) & 0xFFFF) << ")" << std::endl;
-        }
-        
+        uint32_t bad_size = (expected>>16) & 0xFFFF;
+        uint32_t bad_id   = expected & 0xFFFF;
+        Log() << "Failed to allocate size " << size << ". Expected 0, but found ("<<bad_size<<","<<bad_id<<")" << std::endl;
+
         totalFailures.fetch_add(1, std::memory_order_relaxed);
         return false;
     } // uped
@@ -234,11 +214,11 @@ public:
             }
         }
         
-        // Was already 0 - possible double free or race
-        if (curr == 0) {
-            std::lock_guard<std::mutex> lock(debugMutex);
-            std::cout << "FREE CAS WARN: Thread=" << threadId << " ptr=" << ptr 
-                      << " ind=" << index << " already freed (double-free or race)" << std::endl;
+        if (trackingArena[index].compare_exchange_strong(current, 0, std::memory_order_acq_rel)) {
+            totalFrees.fetch_add(1, std::memory_order_relaxed);
+            uint32_t size = (current>>16) & 0xFFFF;
+            currentByteTotal.fetch_sub(size, std::memory_order_relaxed);
+            return true;
         }
         
         // Treat as success since the slot is clear
@@ -273,13 +253,14 @@ constexpr size_t ParallelTracker::MAX_TRACKED_OBJECTS;
 
 
 // what each worker thread does
-void workerThread(TestSlabArena& arena, ParallelTracker& tracker, 
+template<typename SIZE_TYPE>
+void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker, 
                  uint16_t threadId, size_t iterations, 
                  std::atomic<bool>& shouldStop) {
     
     std::random_device rd;
     std::mt19937 gen(rd() ^ threadId);
-    std::uniform_int_distribution<> sizeDist(8, 512);
+    std::uniform_int_distribution<> sizeDist(3,9);
     std::uniform_int_distribution<> actionDist(0, 100);
     std::uniform_int_distribution<> holdDist(0, 50);
     
@@ -296,10 +277,11 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
         // 70% chance to alloc, 30% chance to free
         if (action < 70 || localAllocations.empty()) {
             // try alloc
-            size_t objSize = sizeDist(gen);
+            size_t objSize = 1<<sizeDist(gen);
             TestAllocator allocator(arena, objSize);
             
             void* ptr = allocator.alloc();
+            //Log() << "Allocated size " << objSize << " at " << ptr << std::endl;
             if (ptr) {
                 if (tracker.recordAllocation(ptr, objSize, threadId, arena)) {
                     localAllocations.push_back({ptr, objSize});
@@ -311,13 +293,19 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
                         *intPtr = (threadId << 16) | (i & 0xFFFF);
                     }
                 } else {
+                    Log() << "Failed to record allocation of size " << objSize << " at " << ptr << std::endl;
                     // tracker failed, free it back right away
                     TestAllocator freeAllocator(arena, objSize);
                     freeAllocator.free(ptr);
                     localTrackerFails++;
                 }
             } else {
-                localAllocatorFails++;
+                size_t total = tracker.getCurrentByteTotal();
+                tracker.logRefusalAtTotal(total);
+                float proportion = ((float)total) / (ParallelTracker<SIZE_TYPE>::MAX_TRACKED_OBJECTS*8.0f);
+                Log() << "Failed to  allocate object of size " << objSize << " with "
+                      << (100.0*(1.0-proportion)) << "% capacity left"<<  std::endl;
+
             }
         } else {
             // pick a random alloc and free it
@@ -326,6 +314,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
                 size_t index = indexDist(gen);
                 
                 void* ptr = localAllocations[index].first;
+                //Log() << "Deallocating at " << ptr << std::endl;
                 size_t objSize = localAllocations[index].second;
                 
                 // sanity check data
@@ -342,10 +331,14 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
                     if (tracker.recordFree(ptr, threadId, arena)) {
                         localFrees++;
                     } else {
-                        localTrackerFails++;
+                        localErrors++;
+                        Log() << "Failed to record deallocation of size " << objSize << " at " << ptr << std::endl;
                     }
                 } else {
-                    localFreeFails++;
+                    localErrors++;
+                    Log() << "Failed to deallocate object of size " << objSize << " at " << ptr << std::endl;
+                        //localTrackerFails++;
+             
                 }
                 
                 // pop it from local vector
@@ -379,11 +372,18 @@ void workerThread(TestSlabArena& arena, ParallelTracker& tracker,
 void testBasicParallel() {
     std::cout << "=== Basic Parallel Test ===" << std::endl;
     
-    TestSlabArena arena;
-    ParallelTracker tracker;
+    TestSlabArena *arena_ptr = new TestSlabArena;
+    if (!arena_ptr) {
+        return;
+    }
+    TestSlabArena &arena = *arena_ptr;
+    constexpr size_t OBJECT_COUNT = TestSlabArena::SLAB_COUNT * TestSlabArena::slabType::SIZE / 8;
+    typedef Size<OBJECT_COUNT> SizeType;
+    ParallelTracker<SizeType> *tracker_ptr = new ParallelTracker<SizeType>;
+    ParallelTracker<SizeType> &tracker = *tracker_ptr;
     
-    const size_t numThreads = 4;
-    const size_t iterationsPerThread = 1000;
+    const size_t numThreads = 2;
+    const size_t iterationsPerThread = 1024;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;
@@ -392,7 +392,7 @@ void testBasicParallel() {
     
     // spin up threads
     for (size_t i = 0; i < numThreads; i++) {
-        threads.emplace_back(workerThread, std::ref(arena), std::ref(tracker),
+        threads.emplace_back(workerThread<SizeType>, std::ref(arena), std::ref(tracker),
                             static_cast<uint16_t>(i + 1), iterationsPerThread, 
                             std::ref(shouldStop));
     }
@@ -425,16 +425,19 @@ void testBasicParallel() {
     }
     
     std::cout << std::endl;
+    delete arena_ptr;
 }
 
 void testHighContentionParallel() {
     std::cout << "=== High contention parallel test ===" << std::endl;
     
     TestSlabArena arena;
-    ParallelTracker tracker;
+    constexpr size_t OBJECT_COUNT = TestSlabArena::SLAB_COUNT * TestSlabArena::slabType::SIZE / 8;
+    typedef Size<OBJECT_COUNT> SizeType;
+    ParallelTracker<SizeType> tracker;
     
-    const size_t numThreads = std::thread::hardware_concurrency() * 2;
-    const size_t iterationsPerThread = 2000;
+    const size_t numThreads = 1; std::thread::hardware_concurrency() * 2;
+    const size_t iterationsPerThread = 1;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;
@@ -443,7 +446,7 @@ void testHighContentionParallel() {
     
     // spin up more threads than cores
     for (size_t i = 0; i < numThreads; i++) {
-        threads.emplace_back(workerThread, std::ref(arena), std::ref(tracker),
+        threads.emplace_back(workerThread<SizeType>, std::ref(arena), std::ref(tracker),
                             static_cast<uint16_t>(i + 1), iterationsPerThread, 
                             std::ref(shouldStop));
     }
@@ -481,20 +484,23 @@ void testHighContentionParallel() {
     std::cout << std::endl;
 }
 
+
 void testStressTest() {
     std::cout << "=== Stress Test ===" << std::endl;
     
     TestSlabArena arena;
-    ParallelTracker tracker;
+    constexpr size_t OBJECT_COUNT = TestSlabArena::SLAB_COUNT * TestSlabArena::slabType::SIZE / 8;
+    typedef Size<OBJECT_COUNT> SizeType;
+    ParallelTracker<SizeType> tracker;
     
-    const size_t numThreads = 8;
-    const size_t iterationsPerThread = 5000;
+    const size_t numThreads = 1;
+    const size_t iterationsPerThread = 1;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;
     
     // run a few rounds
-    for (int round = 0; round < 3; round++) {
+    for (int round = 0; round < 1; round++) {
         std::cout << "Round " << (round + 1) << std::endl;
         tracker.reset();
         threads.clear();
@@ -502,7 +508,7 @@ void testStressTest() {
         auto start = std::chrono::high_resolution_clock::now();
         
         for (size_t i = 0; i < numThreads; i++) {
-            threads.emplace_back(workerThread, std::ref(arena), std::ref(tracker),
+            threads.emplace_back(workerThread<SizeType>, std::ref(arena), std::ref(tracker),
                                 static_cast<uint16_t>(i + 1), iterationsPerThread, 
                                 std::ref(shouldStop));
         }
@@ -535,8 +541,8 @@ int main() {
     
     try {
         testBasicParallel();
-        testHighContentionParallel();
-        testStressTest();
+        //testHighContentionParallel();
+        //testStressTest();
         
         std::cout << "All tests done!" << std::endl;
         

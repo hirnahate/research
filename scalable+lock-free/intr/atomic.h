@@ -2,115 +2,54 @@
 #define ATOMIC
 
 namespace atomic {
-/*
-    // Add these specializations after your existing template functions
-template<>
-__host__ __device__ inline size_t add_system<size_t>(size_t* adr, size_t val) {
-    #ifdef __CUDA_ARCH__
-        return atomicAdd((unsigned long long*)adr, (unsigned long long)val);
-    #else
-        return __sync_fetch_and_add(adr, val);
-    #endif
-}
 
-template<>
-__host__ __device__ inline size_t sub_system<size_t>(size_t* adr, size_t val) {
-    #ifdef __CUDA_ARCH__
-        return atomicSub((unsigned long long*)adr, (unsigned long long)val);
-    #else
-        return __sync_fetch_and_sub(adr, val);
-    #endif
-}
-
-template<>
-__host__ __device__ inline size_t CAS_system<size_t>(size_t* adr, size_t comp, size_t val) {
-    #ifdef __CUDA_ARCH__
-        return atomicCAS((unsigned long long*)adr, (unsigned long long)comp, (unsigned long long)val);
-    #else
-        size_t expected = comp;
-        __atomic_compare_exchange(adr, &expected, &val, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-        return expected;
-    #endif
-}
-
-    template<typename T>
-    __host__ __device__ T and_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicAnd(adr,val);
-        #else
-            return __sync_fetch_and_and(adr,val);
-        #endif
-    }
-
-    template<typename T>
-    __host__ __device__ T or_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicOr(adr,val);
-        #else
-            return __sync_fetch_and_or(adr,val);
-        #endif
-    }
-
-    template<typename T>
-    __host__ __device__ T xor_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicXor(adr,val);
-        #else
-            return __sync_fetch_and_xor(adr,val);
-        #endif
-    }
-
-    template<typename T>
-    __host__ __device__ T min_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicMin(adr,val);
-        #else
-            return __sync_fetch_and_min(adr,val);
-        #endif
-    }
-
-    template<typename T>
-    __host__ __device__ T exch_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicExch(adr,val);
-        #else
-            T result;
-            __atomic_exchange(adr,&val,&result,__ATOMIC_ACQ_REL);
-            return result;
-        #endif
-    }
-*/
     template<typename T>
     __host__ __device__ T add_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicAdd(adr,val);
+       #ifdef __CUDA_ARCH__
+            if (sizeof(T) == 4) {
+                return atomicAdd(reinterpret_cast<unsigned int*>(adr), static_cast<unsigned int>(val));
+            } else if (sizeof(T) == 8) {
+                return atomicAdd(reinterpret_cast<unsigned long long*>(adr), static_cast<unsigned long long>(val));
+            }
         #else
-            return __sync_fetch_and_add(adr,val);
+            return __sync_fetch_and_add(adr, val);
         #endif
+        return T{};
     }
 
     template<typename T>
     __host__ __device__ T sub_system(T* adr,T val) {
         #ifdef __CUDA_ARCH__
-            return atomicSub(adr,val);
+            if (sizeof(T) == 4) {
+                return atomicSub(reinterpret_cast<unsigned int*>(adr), static_cast<unsigned int>(val));
+            } else if (sizeof(T) == 8) {
+                return atomicAdd(reinterpret_cast<unsigned long long*>(adr), 
+                               static_cast<unsigned long long>(-static_cast<long long>(val)));
+            }
         #else
-            return __sync_fetch_and_sub(adr,val);
+            return __sync_fetch_and_sub(adr, val);
         #endif
+        return T{};
     }
 
     template<typename T>
     __host__ __device__ T and_system(T* adr,T val) {
-        #ifdef __CUDA_ARCH__
-            return atomicAnd(adr,val);
+         #ifdef __CUDA_ARCH__
+            if (sizeof(T) == 4) {
+                return atomicAnd(reinterpret_cast<unsigned int*>(adr), static_cast<unsigned int>(val));
+            } else if (sizeof(T) == 8) {
+                return atomicAnd(reinterpret_cast<unsigned long long*>(adr), static_cast<unsigned long long>(val));
+            }
         #else
-            return __sync_fetch_and_and(adr,val);
+            return __sync_fetch_and_and(adr, val);
         #endif
+        return T{};
     }
 
     template<typename T>
     __host__ __device__ T or_system(T* adr,T val) {
         #ifdef __CUDA_ARCH__
-            return atomicOr(adr,val);
+            return atomicOr_system(adr,val);
         #else
             return __sync_fetch_and_or(adr,val);
         #endif
@@ -137,28 +76,39 @@ __host__ __device__ inline size_t CAS_system<size_t>(size_t* adr, size_t comp, s
     template<typename T>
     __host__ __device__ T exch_system(T* adr,T val) {
         #ifdef __CUDA_ARCH__
-            return atomicExch_system(adr,val);
+            if (sizeof(T) == 4) {
+                return atomicExch(reinterpret_cast<unsigned int*>(adr), static_cast<unsigned int>(val));
+            } else if (sizeof(T) == 8) {
+                return atomicExch(reinterpret_cast<unsigned long long*>(adr), static_cast<unsigned long long>(val));
+            }
         #else
             T result;
-            __atomic_exchange(adr,&val,&result,__ATOMIC_ACQ_REL);
+            __atomic_exchange(adr, &val, &result, __ATOMIC_ACQ_REL);
             return result;
         #endif
+        return T{};
     }
 
     template<typename T>
     __host__ __device__ T CAS_system(T* adr,T comp,T val) {
         #ifdef __CUDA_ARCH__
-            return atomicCAS_system(adr,comp,val);
-        #else
-            bool success = false;
-            T expected = comp;
-            while ((!success) && (comp == expected)) {
-                success = __atomic_compare_exchange(adr,&expected,&val,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+            if (sizeof(T) == 4) {
+                return atomicCAS(reinterpret_cast<unsigned int*>(adr), 
+                               static_cast<unsigned int>(comp), 
+                               static_cast<unsigned int>(val));
+            } else if (sizeof(T) == 8) {
+                return atomicCAS(reinterpret_cast<unsigned long long*>(adr), 
+                               static_cast<unsigned long long>(comp), 
+                               static_cast<unsigned long long>(val));
             }
+        #else
+            T expected = comp;
+            __atomic_compare_exchange_n(adr, &expected, val, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
             return expected;
         #endif
+        return T{};
     }
-
+    
     template<typename T>
     __host__ __device__ inline void store_relaxed(T* adr, T val) {
         #ifdef __CUDA_ARCH__

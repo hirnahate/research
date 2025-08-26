@@ -67,7 +67,7 @@ struct defaultSlabProxy {
 
     allocMaskElem allocMask;
     AllocState allocState;
-    std::atomic<uint32_t> reservationState{FREE};
+    uint32_t reservationState{FREE};
 
     __host__ __device__
     size_t getSize()
@@ -95,31 +95,26 @@ struct defaultSlabProxy {
     
     __host__ __device__
     bool isAvailable(){
-        uint32_t state = reservationState.load(std::memory_order_acquire);
+        uint32_t state = intr::atomic::load_acquire(&reservationState);
         return (state == ACTIVE && !isFull()) || state == FREE;
     }
 
     __host__ __device__
     bool tryReserve(){
         uint32_t expected = FREE;
-        // return intr::atomic::CAS_system();
-        return reservationState.compare_exchange_strong(
-            expected, RESERVING, std::memory_order_acq_rel);
+        uint32_t old = intr::atomic::CAS_system(&reservationState, expected, static_cast<uint32_t>(RESERVING));
+        return (old == expected);
     }
 
     __host__ __device__
     bool confirmReservation(size_t objectSz){
-        if(bindSize(objectSz)){
-            reservationState.store(ACTIVE, std::memory_order_release);
-            return true;
-        }
-        reservationState.store(FREE, std::memory_order_release);
-        return false;
+        intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(ACTIVE));
+        return true;
     }
 
     __host__ __device__
     void releaseReservation(){
-        reservationState.store(FREE, std::memory_order_release);
+        intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(FREE));
     }
 
     __host__ __device__
@@ -135,10 +130,10 @@ struct defaultSlabProxy {
             return false;
         
         allocMaskElem prev = intr::atomic::exch_system(&allocState, 0ull);
-        bool success = ((prev & SIZE_MASK) != 0) && ((prev & COUNT_MASK) = 0);
+        bool success = ((prev & SIZE_MASK) != 0) && ((prev & COUNT_MASK) == 0);
 
         if(success)
-            reservationState.store(FREE, std::memory_order_release);
+            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(FREE));
 
         return success;
     }
@@ -182,11 +177,11 @@ struct defaultSlabProxy {
         if(currentState != 0) {
             size_t currentSize = (currentState & SIZE_MASK) >> OFFSET;
             return (currentSize == objectSize) 
-            && (reservationState.load(std::memory_order_acquire) == ACTIVE);
+            && (intr::atomic::load_acquire(&reservationState) == ACTIVE);
         }
 
         // new slabs
-        if(reservationState.load() != RESERVING)
+        if(intr::atomic::load_acquire(&reservationState) != RESERVING)
             return false;
 
         AllocState startingState = ((AllocState)objectSize) << OFFSET;
@@ -217,17 +212,17 @@ struct defaultSlabProxy {
         for(size_t attempts = 0; attempts < SLAB_ELEM_BIT_SIZE; attempts++){
             allocMaskElem currentMask = elem;
             
-            // Find first free bit
+            // find first free bit
             allocMaskElem freeMask = ~currentMask;
             if(freeMask == 0) return false;
             
             #if defined(__CUDA_ARCH__)
-                // CUDA device ~ use __ffsll (returns 1-based index of least-significant set bit)
+                // if CUDA device ... use __ffsll
                 int ff = __ffsll(static_cast<unsigned long long>(freeMask));
                 if(ff == 0) return false;
                     size_t target = static_cast<size_t>(ff - 1);
             #else
-                // host ~ use compiler builtin
+                // if host ... use compiler builtin
                 size_t target = static_cast<size_t>(__builtin_ctzll(static_cast<unsigned long long>(freeMask)));
             #endif
 
@@ -236,12 +231,12 @@ struct defaultSlabProxy {
             allocMaskElem targetBit = ((allocMaskElem)1) << target;
             allocMaskElem expected = currentMask;
             
-            // Atomic compare-and-swap to claim the bit
+            // claim bit
             if(intr::atomic::CAS_system(&elem, expected, currentMask | targetBit) == expected) {
                 result = target;
                 return true;
             }
-            // CAS failed, retry with updated mask
+            // CAS failed? retry with updated mask
         }
         return false;
     } // end of attempt
@@ -315,9 +310,9 @@ struct defaultSlabProxy {
 
         slabEmptied = (prevCount == 1);
         if(slabEmptied){
-            reservationState.store(ACTIVE, std::memory_order_release);
-        } else if(reservationState.load() == FULL){
-            reservationState.store(ACTIVE, std::memory_order_release);
+            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(ACTIVE));
+        } else if(intr::atomic::load_relaxed(&reservationState) == FULL){
+            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(ACTIVE));
         }
 
 
@@ -411,6 +406,7 @@ class SlabArena {
         typedef Node<slabProxyType, slabAddrType, Size<2>> proxyNodeType;
 
         static const size_t SLAB_COUNT = (ARENA_SIZE::VALUE + SLAB_TYPE::SIZE - 1) / SLAB_TYPE::SIZE;
+        static const slabAddrType NULL_ADDR = static_cast<slabAddrType>(-1);
 
         typedef DirectArena<slabType, slabAddrType, Size<SLAB_COUNT>> BackingArenaType;
         typedef DirectArena<proxyNodeType, slabAddrType, Size<SLAB_COUNT>> ProxyArenaType;
@@ -418,17 +414,91 @@ class SlabArena {
     private:
         BackingArenaType slabs;
         ProxyArenaType proxies;
-        std::atomic<size_t> nextSearch{0};
+        
+        slabAddrType freeListHead;
+        size_t nextSearch;
 
     public:
         __host__ __device__
         SlabArena() {
+            intr::atomic::store_relaxed(&freeListHead, NULL_ADDR);
+            intr::atomic::store_relaxed(&nextSearch, static_cast<size_t>(0));
+            
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 proxies.arena[i].data.allocState = 0;
                 proxies.arena[i].data.allocMask = 0;
-                proxies.arena[i].data.reservationState.store(slabProxyType::FREE, std::memory_order_relaxed);
+                intr::atomic::store_relaxed(&proxies.arena[i].data.reservationState, static_cast<uint32_t>(slabProxyType::FREE));
+
+                // build list
+                proxies.arena[i].next = (i == SLAB_COUNT - 1) ? NULL_ADDR : static_cast<slabAddrType>(i + 1);
+                proxies.arena[i].prev = (i == 0) ? NULL_ADDR : static_cast<slabAddrType>(i - 1);
             }
         } 
+
+
+        __host__ __device__
+        slabAddrType popFreeList(){
+            slabAddrType current = intr::atomic::load_acquire(&freeListHead);
+
+            while(current != NULL_ADDR){
+                slabAddrType next = proxies.arena[current].next;
+                slabAddrType old = intr::atomic::CAS_system(&freeListHead, current, next);
+                if(old == current){
+                    proxies.arena[current].next = NULL_ADDR;
+                    proxies.arena[current].prev = NULL_ADDR;
+                    return current;
+                }
+                current = old;
+            }
+
+            return NULL_ADDR;
+        } // end of pop
+
+        __host__ __device__
+        void pushFreeList(slabAddrType slabInd){
+            if(slabInd >= SLAB_COUNT)
+                return;
+
+            slabAddrType oldHead = intr::atomic::load_acquire(&freeListHead);
+
+            do {
+                proxies.arena[slabInd].next = oldHead;
+                proxies.arena[slabInd].prev = NULL_ADDR;
+
+                // if oldHead, update prev
+                if(oldHead != NULL_ADDR)
+                    proxies.arena[oldHead].prev = slabInd;
+
+                slabAddrType old = intr::atomic::CAS_system(&freeListHead, oldHead, slabInd);
+                if(old == oldHead) break;
+                    oldHead = old;
+            } while(true);
+        } // end of push
+
+        __host__ __device__
+        void removeFromFreeList(slabAddrType slabInd){
+            if(slabInd >= SLAB_COUNT)
+                return;
+
+            slabAddrType prev = proxies.arena[slabInd].prev;
+            slabAddrType next = proxies.arena[slabInd].next;
+
+            // updates prevs next
+            if(prev != NULL_ADDR){
+                proxies.arena[prev].next = next;
+            } else {
+                // it was the head!
+                slabAddrType expected = slabInd;
+                intr::atomic::CAS_system(&freeListHead, expected, next);
+            }
+            // update nexts prev
+            if(next != NULL_ADDR)
+                proxies.arena[next].prev = prev;
+            
+            
+            proxies.arena[slabInd].next = NULL_ADDR;
+            proxies.arena[slabInd].prev = NULL_ADDR;
+        } // end
 
         __host__ __device__
         bool isValidPtr(void* ptr){
@@ -486,51 +556,102 @@ class SlabArena {
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 slabProxyType& proxy = proxies.arena[i].data;
                 if(proxy.getSize() == objectSize && 
-                proxy.reservationState.load(std::memory_order_acquire) == slabProxyType::ACTIVE 
+                intr::atomic::load_acquire(&proxy.reservationState) == slabProxyType::ACTIVE 
                 && !proxy.isFull())
                     return static_cast<slabAddrType>(i);
             }
 
-            // try to res a free slab
-            size_t start = nextSearch.fetch_add(1, std::memory_order_relaxed) % SLAB_COUNT;
+            // try free slab from the free list
+            slabAddrType freeSlab = popFreeList();
+            if (freeSlab != NULL_ADDR) {
+                slabProxyType& proxy = proxies.arena[freeSlab].data;
+                if (proxy.tryReserve()) {
+                    return freeSlab;
+                } else {
+                    // fail? back to list
+                    pushFreeList(freeSlab);
+                }
+            }
+
+            // fallback - round-robin search 
+            size_t start = intr::atomic::add_system(&nextSearch, static_cast<size_t>(1)) % SLAB_COUNT;
             for(size_t offset = 0; offset < SLAB_COUNT; offset++){
                 size_t i = (start + offset) % SLAB_COUNT;
                 slabProxyType& proxy = proxies.arena[i].data;
 
-                if(proxy.reservationState.load(std::memory_order_acquire) == slabProxyType::FREE
+                if(intr::atomic::load_acquire(&proxy.reservationState) == slabProxyType::FREE
                 && proxy.getSize() == 0){
-                    if(proxy.tryReserve())
+                    if(proxy.tryReserve()) {
+                        // remove from free list - reserved
+                        removeFromFreeList(static_cast<slabAddrType>(i));
                         return static_cast<slabAddrType>(i);
+                    }
                 }
             }
             
-            return slabAddrType(0);
+            return NULL_ADDR;
         } // end of alloc
 
         __host__ __device__
         bool free(slabAddrType slabAddr){
             if(slabAddr >= SLAB_COUNT)
                 return false;
-            return proxies.arena[slabAddr].data.clearAllocState();
+            bool success = proxies.arena[slabAddr].data.clearAllocState();
+            if (success)
+                pushFreeList(slabAddr);
+            
+        return success;
         } // end of free
 
         __host__ __device__
-        void getStats(size_t& totalSlabs, size_t& usedSlabs, size_t& emptyResusables){
+        void getStats(size_t& totalSlabs, size_t& usedSlabs, size_t& emptyReusables, size_t& freeSlabs){
             totalSlabs = SLAB_COUNT;
             usedSlabs = 0;
-            emptyResusables = 0;
+            emptyReusables = 0;
+            freeSlabs = 0;
+
+            slabAddrType current = intr::atomic::load_acquire(&freeListHead);
+            while (current != NULL_ADDR) {
+                freeSlabs++;
+                current = proxies.arena[current].next;
+            }
 
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 slabProxyType& proxy = proxies.arena[i].data;
                 if(proxy.getSize() > 0){
                     if(proxy.isEmpty()){
-                        emptyResusables++;
+                        emptyReusables++;
                     } else {
                         usedSlabs++;
                     }
                 }
             }
         } // end of getStats
+
+        __host__ __device__
+        bool validateFreeList() {
+            size_t count = 0;
+            slabAddrType current = intr::atomic::load_acquire(&freeListHead);
+            slabAddrType prev = NULL_ADDR;
+            
+            while (current != NULL_ADDR && count < SLAB_COUNT) {
+                // check that prev
+                if (proxies.arena[current].prev != prev) {
+                    return false;
+                }
+                
+                // check slab is free
+                if (proxies.arena[current].data.getSize() != 0) {
+                    return false;
+                }
+                
+                prev = current;
+                current = proxies.arena[current].next;
+                count++;
+            }
+            
+            return count < SLAB_COUNT; 
+        }
 }; // end of SlabArena
 
 // test allocator

@@ -16,7 +16,7 @@ template <typename SIZE_TYPE>
 class ParallelTracker {
 public:
     //static constexpr size_t PER_SLAB_STRIDE = 512;
-    static constexpr size_t MAX_TRACKED_OBJECTS = SIZE_TYPE::VALUE;
+    static constexpr size_t MAX_TRACKED_OBJECTS = TestSlabArena::SLAB_COUNT * 1024;
 private:
     // each entry: [31:16] = size, [15:0] = thread_id, 0 = free
     // std::atomic<uint32_t> trackingArena[MAX_TRACKED_OBJECTS];
@@ -63,13 +63,41 @@ public:
         if (!ptr) 
             return MAX_TRACKED_OBJECTS;
         
+        // find slab index holding ptr
+        auto slabInd = arena.slabIndexFor(ptr);
+        if(slabInd >= TestSlabArena::SLAB_COUNT)
+            return MAX_TRACKED_OBJECTS;
+
+        auto& slab = arena.slabAt(slabInd);
+        char* slabStart = static_cast<char*>(static_cast<void*>(&slab));
         char* ptrChar = static_cast<char*>(ptr);
-        char* arenaBase = static_cast<char*>(static_cast<void*>(&arena));
 
-        size_t offset = ptrChar - arenaBase;
-        size_t index = offset / 8; // assuming 64-byte chunks
+        size_t offset = ptrChar - slabStart;
 
-        return (index < MAX_TRACKED_OBJECTS) ? index : MAX_TRACKED_OBJECTS;
+        auto& proxy = arena.proxyAt(slabInd).data;
+        size_t objectSz = proxy.getSize();
+
+        if(objectSz == 0)
+            return MAX_TRACKED_OBJECTS;
+
+        size_t maxObj = proxy.slabObjCount(objectSz);
+        size_t maskElemCount = (maxObj + proxy.SLAB_ELEM_BIT_SIZE - 1) / proxy.SLAB_ELEM_BIT_SIZE;
+        size_t maskOverhead = maskElemCount * sizeof(typename TestSlabArena::slabProxyType::allocMaskElem);
+
+        if(offset < maskOverhead)
+            return MAX_TRACKED_OBJECTS;
+
+        size_t objectOffset = offset - maskOverhead;
+        if(objectOffset % objectSz != 0)
+            return MAX_TRACKED_OBJECTS;
+
+        size_t objectInd = objectOffset / objectSz;
+        if(objectInd >= maxObj)
+            return MAX_TRACKED_OBJECTS;
+
+        size_t globalInd = slabInd * 1024 + objectInd;
+
+        return (globalInd < MAX_TRACKED_OBJECTS) ? globalInd : MAX_TRACKED_OBJECTS;
     }
     
     // log an allocation with CAS

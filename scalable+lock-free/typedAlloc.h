@@ -111,7 +111,7 @@ public:
     
     // placement...new construct
     template<typename... Args>
-    __host__ __device__
+    __host__ 
     void construct(pointer ptr, Args&&... args) {
         if (!ptr) return;
         ::new (static_cast<void*>(ptr)) T(static_cast<Args&&>(args)...);
@@ -129,7 +129,7 @@ public:
     
     // alloc + construct in one go
     template<typename... Args>
-    __host__ __device__
+    __host__
     pointer create(Args&&... args) {
         pointer ptr = allocate(1);
         if (!ptr) {
@@ -137,16 +137,16 @@ public:
         }
         
         #ifdef __CUDA_ARCH__
-        construct(ptr, static_cast<Args&&>(args)...);
-        return ptr;
-        #else
-        try {
             construct(ptr, static_cast<Args&&>(args)...);
             return ptr;
-        } catch (...) {
-            deallocate(ptr, 1);
-            return nullptr;
-        }
+        #else
+            try {
+                construct(ptr, static_cast<Args&&>(args)...);
+                return ptr;
+            } catch (...) {
+                deallocate(ptr, 1);
+                return nullptr;
+            }
         #endif
     }
     
@@ -220,7 +220,7 @@ TypeAllocator<T, SlabAllocatorType> make_type_allocator(SlabAllocatorType& alloc
 }
 
 template<typename T, typename SlabAllocatorType, typename... Args>
-__host__ __device__
+__host__
 T* create_object(SlabAllocatorType& allocator, Args&&... args) {
     TypeAllocator<T, SlabAllocatorType> alloc(allocator);
     return alloc.create(static_cast<Args&&>(args)...);

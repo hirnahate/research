@@ -68,25 +68,29 @@ public:
         if(slabInd >= TestSlabArena::SLAB_COUNT)
             return MAX_TRACKED_OBJECTS;
 
+        // find beginning - skip mask
         auto& slab = arena.slabAt(slabInd);
         char* slabStart = static_cast<char*>(static_cast<void*>(&slab));
         char* ptrChar = static_cast<char*>(ptr);
 
         size_t offset = ptrChar - slabStart;
 
+        // find size and mask layout
         auto& proxy = arena.proxyAt(slabInd).data;
         size_t objectSz = proxy.getSize();
 
         if(objectSz == 0)
             return MAX_TRACKED_OBJECTS;
-
+        
+        // find mask overhead
         size_t maxObj = proxy.slabObjCount(objectSz);
         size_t maskElemCount = (maxObj + proxy.SLAB_ELEM_BIT_SIZE - 1) / proxy.SLAB_ELEM_BIT_SIZE;
         size_t maskOverhead = maskElemCount * sizeof(typename TestSlabArena::slabProxyType::allocMaskElem);
 
         if(offset < maskOverhead)
             return MAX_TRACKED_OBJECTS;
-
+        
+        // alignment check
         size_t objectOffset = offset - maskOverhead;
         if(objectOffset % objectSz != 0)
             return MAX_TRACKED_OBJECTS;
@@ -95,14 +99,16 @@ public:
         if(objectInd >= maxObj)
             return MAX_TRACKED_OBJECTS;
 
-        size_t globalInd = slabInd * 1024 + objectInd;
-
-        return (globalInd < MAX_TRACKED_OBJECTS) ? globalInd : MAX_TRACKED_OBJECTS;
+        size_t objectsPerSlab = proxy.slabObjCount(objectSz);
+        size_t globalInd = slabInd * objectsPerSlab + objectInd;
+        
+        return globalInd;
     }
     
     // log an allocation with CAS
     bool recordAllocation(void* ptr, size_t size, uint16_t threadId, TestSlabArena& arena) {
         size_t index = getIndexForPtr(ptr, arena);
+        printf("TRACKING  :  ptr=%p -> index=%zu (max=%zu)\n", ptr, index, MAX_TRACKED_OBJECTS);
         if (index >= MAX_TRACKED_OBJECTS) {
             Log() << "Failed: Allocation index for size "<< size 
                   << " at " << ptr <<" exceeds arena bounds!" << std::endl;
@@ -310,7 +316,7 @@ void testBasicParallel() {
     ParallelTracker<SizeType> &tracker = *tracker_ptr;
     
     const size_t numThreads = 4;
-    const size_t iterationsPerThread = 500;
+    const size_t iterationsPerThread = 10000;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;
@@ -365,9 +371,9 @@ void testHighContentionParallel() {
     typedef Size<OBJECT_COUNT> SizeType;
     ParallelTracker<SizeType> tracker;
     
-    const size_t numThreads = 1; 
+    const size_t numThreads = 4; 
     std::thread::hardware_concurrency() * 2;
-    const size_t iterationsPerThread = 1;
+    const size_t iterationsPerThread = 500;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;
@@ -423,8 +429,8 @@ void testStressTest() {
     typedef Size<OBJECT_COUNT> SizeType;
     ParallelTracker<SizeType> tracker;
     
-    const size_t numThreads = 1;
-    const size_t iterationsPerThread = 1;
+    const size_t numThreads = 4;
+    const size_t iterationsPerThread = 500;
     
     std::atomic<bool> shouldStop{false};
     std::vector<std::thread> threads;

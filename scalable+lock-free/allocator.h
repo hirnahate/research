@@ -2,7 +2,6 @@
 #include "intr/mod.h"
 #include <cstddef>
 #include <cstdint>
-//#include <device_launch_parameters.h>
 
 #ifdef __CUDACC__
     #include <cuda_runtime.h>
@@ -35,7 +34,6 @@ struct AdrInfo {
 template <size_t SLAB_SIZE = DEFAULT_SLAB_SIZE, typename ELEM_TYPE = defaultAllocMaskElem>
 struct Slab {
     typedef ELEM_TYPE allocMaskElem;
-
     static const size_t ELEM_SIZE = sizeof(ELEM_TYPE);
     static const size_t SIZE = SLAB_SIZE;
     static const size_t ELEM_COUNT = (SLAB_SIZE + ELEM_SIZE - 1) / ELEM_SIZE;
@@ -70,11 +68,11 @@ struct defaultSlabProxy {
 
     __host__ __device__
     size_t getSize()
-    { return (intr::atomic::load_relaxed(&allocState) & SIZE_MASK) >> OFFSET;}
+    { return (intr::atomic::load_acquire(&allocState) & SIZE_MASK) >> OFFSET;}
 
     __host__ __device__
     size_t getCount()
-    { return intr::atomic::load_relaxed(&allocState) & COUNT_MASK;}
+    { return intr::atomic::load_acquire(&allocState) & COUNT_MASK;}
 
     __host__ __device__
     size_t isEmpty()
@@ -82,11 +80,12 @@ struct defaultSlabProxy {
 
     __host__ __device__
     bool isFull(){
-        size_t objSize = getSize();
+        AllocState currentState = intr::atomic::load_acquire(&allocState);
+        size_t objSize = (currentState & SIZE_MASK) >> OFFSET;
         if(objSize == 0)
             return false;
 
-        size_t currentCount = getCount();
+        size_t currentCount = currentState & COUNT_MASK;
         size_t maxCount = slabObjCount(objSize);
                 
         return (currentCount >= maxCount);
@@ -98,28 +97,29 @@ struct defaultSlabProxy {
         return (state == PARTIAL && !isFull());
     }
 
+    // atomics..
     __host__ __device__
     bool tryClaim(size_t objectSz){
         AllocState expected = 0;
         AllocState newState = ((AllocState)objectSz) << OFFSET;
 
-        AllocState old = intr::atomic::CAS_system(&allocState, expected, newState);
+        AllocState old = intr::atomic::CAS_acq_rel(&allocState, expected, newState);
         if(old == expected){
-            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(PARTIAL));
-            allocMask = 0;
+            intr::atomic::store_release(&reservationState, static_cast<uint32_t>(PARTIAL));
+            intr::atomic::store_relaxed(&allocMask, static_cast<allocMaskElem>(0));
             return true;
         }
 
-        AllocState current = intr::atomic::load_relaxed(&allocState);
+        AllocState current = intr::atomic::load_acquire(&allocState);
         size_t currentSz = (old & SIZE_MASK) >> OFFSET;
-        uint32_t state = intr::atomic::load_relaxed(&reservationState);
+        uint32_t state = intr::atomic::load_acquire(&reservationState);
 
         return (currentSz == objectSz) && (state == PARTIAL);
     } // end of tryClaim
 
     __host__ __device__
     bool clearAllocState(){
-        AllocState current = intr::atomic::load_relaxed(&allocState);
+        AllocState current = intr::atomic::load_acquire(&allocState);
 
         while(true){
             size_t count = current & COUNT_MASK;
@@ -129,9 +129,9 @@ struct defaultSlabProxy {
             if(size == 0)
                 return false;
 
-            AllocState old = intr::atomic::CAS_system(&allocState, current, 0ull);
+            AllocState old = intr::atomic::CAS_acq_rel(&allocState, current, 0ull);
             if(old == current){
-                intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(FREE));
+                intr::atomic::store_release(&reservationState, static_cast<uint32_t>(FREE));
                 return true;
             }
             current = old;
@@ -159,9 +159,11 @@ struct defaultSlabProxy {
         return realObjs;
     } // end of slabObjCount
 
+    
     __host__ __device__
     bool tryAllocateBit(allocMaskElem& elem, size_t& bitIndex){
         for(size_t attempts = 0; attempts < 64; attempts++){
+            // fresh loak each iter
             allocMaskElem currentMask = intr::atomic::load_acquire(&elem);
 
             allocMaskElem freeMask = ~currentMask;
@@ -183,7 +185,7 @@ struct defaultSlabProxy {
             allocMaskElem targetBit = ((allocMaskElem)1) << target;
             allocMaskElem newMask = currentMask | targetBit;
 
-            allocMaskElem old = intr::atomic::CAS_system(&elem, currentMask, newMask);
+            allocMaskElem old = intr::atomic::CAS_acq_rel(&elem, currentMask, newMask);
             if(old == currentMask){
                 bitIndex = target;
                 return true;
@@ -192,50 +194,6 @@ struct defaultSlabProxy {
         return false;
     } // end of tryAllocBit
 
-
-    __host__ __device__
-    void clearSlab(SLAB_TYPE* slab, size_t maskElemCount){
-        for(size_t i = 0; i < maskElemCount; i++)
-            slab->data[i] = 0;
-    }
-
-    __host__ __device__
-    bool attemptMaskAlloc(allocMaskElem& elem, size_t& result){
-        for(size_t attempts = 0; attempts < SLAB_ELEM_BIT_SIZE; attempts++){
-            allocMaskElem currentMask = elem;
-            
-            // find first free bit
-            allocMaskElem freeMask = ~currentMask;
-            if(freeMask == 0) 
-                return false;
-            
-            #if defined(__CUDA_ARCH__)
-                // if CUDA device ... use __ffsll
-                int ff = __ffsll(static_cast<unsigned long long>(freeMask));
-                if(ff == 0) return false;
-                    size_t target = static_cast<size_t>(ff - 1);
-            #else
-                // if host ... use compiler builtin
-                size_t target = static_cast<size_t>(__builtin_ctzll(static_cast<unsigned long long>(freeMask)));
-            #endif
-
-            if(target >= SLAB_ELEM_BIT_SIZE) 
-                return false;
-            
-            allocMaskElem targetBit = ((allocMaskElem)1) << target;
-            allocMaskElem expected = currentMask;
-            
-            allocMaskElem old = intr::atomic::CAS_system(&elem, expected, currentMask | targetBit);
-            if(old == expected){
-                result = target;
-                return true;
-            }
-            printf(":( - CAS failed(proxy) - Expected:0x%llx Got:0x%llx (retry %zu)\n", 
-               (unsigned long long)expected, (unsigned long long)old, attempts);
-
-        }
-        return false;
-    } // end of attempt
 
     __host__ __device__
     void* indexToPtr(SLAB_TYPE* slab, size_t objectSize, size_t maskElemCount, size_t ind){
@@ -249,16 +207,35 @@ struct defaultSlabProxy {
     __host__ __device__
     void* alloc(SLAB_TYPE* slab, bool& slabFilled){
         // just in case...
-        uint32_t currentReservState = intr::atomic::load_relaxed(&reservationState);
+        uint32_t currentReservState = intr::atomic::load_acquire(&reservationState);
         if(currentReservState == FULL)
             return nullptr;
         
-        AllocState currentState = intr::atomic::load_relaxed(&allocState);
+        AllocState currentState = intr::atomic::load_acquire(&allocState);
         size_t objectSz = (currentState & SIZE_MASK) >> OFFSET;
+        size_t currentCount = currentState & COUNT_MASK;
         size_t maxObjCount = slabObjCount(objectSz);
 
         if(maxObjCount == 0)
             return nullptr;
+
+        // check capacity BEFORE tryAlloc
+        if(currentCount >- maxObjCount){
+            intr::atomic::store_release(&reservationState, static_cast<uint32_t>(FULL));
+            return nullptr;
+        }
+
+        // resrver count slot..
+        AllocState newState = intr::atomic::add_acq_rel(&allocState, (AllocState)1);
+        size_t newCount = newState & COUNT_MASK;
+
+        // check!
+        if(newCount > maxObjCount){
+            // rollback
+            intr::atomic::add_acq_rel(&allocState, ((AllocState)0) - ((AllocState)1));
+            intr::atomic::store_release(&reservationState, static_cast<uint32_t>(FULL));
+            return nullptr;
+        }
 
         size_t maskElemCount = (maxObjCount + SLAB_ELEM_BIT_SIZE - 1) / SLAB_ELEM_BIT_SIZE;
 
@@ -285,47 +262,16 @@ struct defaultSlabProxy {
         }
         
         if(!bitAllocated) {
-            printf(":( - No bits available - maxObj:%zu maskElems:%zu (alloc)\n", maxObjCount, maskElemCount);
-            // Check each mask element
-            for(size_t i = 0; i < maskElemCount; i++) {
-                allocMaskElem mask = (maxObjCount <= SLAB_ELEM_BIT_SIZE) ? allocMask : slab->data[i];
-                printf(":( - Mask[%zu] = 0x%llx (popcount: %d)\n", 
-                    i, (unsigned long long)mask, __builtin_popcountll(mask));
-            }
-            return nullptr;
-        }
-
-        if(!bitAllocated){
-            // no bits - slab is full
-            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(FULL));
-            return nullptr;
-        }
-
-        // increment count only after bit is secured!!
-        AllocState prev = intr::atomic::add_system(&allocState, (AllocState)1);
-        AllocState newCount = (prev & COUNT_MASK) + 1;
-
-        // sanity check
-        if(newCount > maxObjCount){
-            printf(":( - Count exceeded max after bit allocation! Count:%llu Max:%zu\n", 
-                   (unsigned long long)newCount, maxObjCount);
-            // decrement count and clear bit
-            intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
-
-            allocMaskElem clearBit = ~(((allocMaskElem)1) << (globalIndex % SLAB_ELEM_BIT_SIZE));
-            if(maxObjCount <= SLAB_ELEM_BIT_SIZE){
-                intr::atomic::and_system(&allocMask, clearBit);
-            } else {
-                size_t maskInd = globalIndex / SLAB_ELEM_BIT_SIZE;
-                intr::atomic::and_system(&slab->data[maskInd], clearBit);
-            }
+            // rollback count
+            intr::atomic::add_acq_rel(&allocState, ((AllocState)0) - ((AllocState)1));
+            //printf(":( - No bits available - maxObj:%zu maskElems:%zu (alloc)\n", maxObjCount, maskElemCount);
             return nullptr;
         }
 
         // update slab state
         slabFilled = (newCount == maxObjCount);
         if(slabFilled)
-            intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(FULL));
+            intr::atomic::store_release(&reservationState, static_cast<uint32_t>(FULL));
 
         void* result = indexToPtr(slab, objectSz, maskElemCount, globalIndex);
 
@@ -341,7 +287,7 @@ struct defaultSlabProxy {
         char* slabBytePtr = static_cast<char*>(static_cast<void*>(slab));
         size_t byteOffset = objBytePtr - slabBytePtr;
 
-        AllocState currentState = intr::atomic::load_relaxed(&allocState);
+        AllocState currentState = intr::atomic::load_acquire(&allocState);
         size_t objectSz = (currentState & SIZE_MASK) >> OFFSET;
         size_t currentCount = currentState & COUNT_MASK;
         size_t maxObjCount = slabObjCount(objectSz);
@@ -376,9 +322,9 @@ struct defaultSlabProxy {
         allocMaskElem prevMask;
 
         if(maskCount <= 1) {
-            prevMask = intr::atomic::and_system(&allocMask, ~targetMask);
+            prevMask = intr::atomic::and_acq_rel(&allocMask, ~targetMask);
         } else {
-            prevMask = intr::atomic::and_system(&(slab->data[maskIndex]), ~targetMask);
+            prevMask = intr::atomic::and_acq_rel(&(slab->data[maskIndex]), ~targetMask);
         }
 
         // check if bit was actually set
@@ -387,14 +333,14 @@ struct defaultSlabProxy {
             return false; 
 
         // decrement count after clearing bit
-        AllocState prev = intr::atomic::add_system(&allocState, ((AllocState)0) - ((AllocState)1));
+        AllocState prev = intr::atomic::add_acq_rel(&allocState, ((AllocState)0) - ((AllocState)1));
         AllocState newCount = (prev & COUNT_MASK) - 1;
         
         slabEmptied = (newCount == 0);
         if(!slabEmptied) {
-            uint32_t state = intr::atomic::load_relaxed(&reservationState);
+            uint32_t state = intr::atomic::load_acquire(&reservationState);
             if(state == FULL) 
-                intr::atomic::store_relaxed(&reservationState, static_cast<uint32_t>(PARTIAL));
+                intr::atomic::store_release(&reservationState, static_cast<uint32_t>(PARTIAL));
         }
         
         return true;
@@ -468,8 +414,8 @@ class SlabArena {
             intr::atomic::store_relaxed(&nextSearch, static_cast<size_t>(0));
             
             for(size_t i = 0; i < SLAB_COUNT; i++){
-                proxies.arena[i].data.allocState = 0;
-                proxies.arena[i].data.allocMask = 0;
+                intr::atomic::store_relaxed(&proxies.arena[i].data.allocState, static_cast<typename slabProxyType::AllocState>(0));
+                intr::atomic::store_relaxed(&proxies.arena[i].data.allocMask, static_cast<typename slabProxyType::allocMaskElem>(0));
                 intr::atomic::store_relaxed(&proxies.arena[i].data.reservationState, static_cast<uint32_t>(slabProxyType::FREE));
 
                 // build list
@@ -485,7 +431,7 @@ class SlabArena {
 
             while(current != NULL_ADDR){
                 slabAddrType next = proxies.arena[current].next;
-                slabAddrType old = intr::atomic::CAS_system(&freeListHead, current, next);
+                slabAddrType old = intr::atomic::CAS_acq_rel(&freeListHead, current, next);
                 if(old == current){
                     proxies.arena[current].next = NULL_ADDR;
                     proxies.arena[current].prev = NULL_ADDR;
@@ -512,9 +458,10 @@ class SlabArena {
                 if(oldHead != NULL_ADDR)
                     proxies.arena[oldHead].prev = slabInd;
 
-                slabAddrType old = intr::atomic::CAS_system(&freeListHead, oldHead, slabInd);
-                if(old == oldHead) break;
-                    oldHead = old;
+                slabAddrType old = intr::atomic::CAS_acq_rel(&freeListHead, oldHead, slabInd);
+                if(old == oldHead) 
+                    break;
+                oldHead = old;
             } while(true);
         } // end of push
 
@@ -532,7 +479,7 @@ class SlabArena {
             } else {
                 // it was the head!
                 slabAddrType expected = slabInd;
-                intr::atomic::CAS_system(&freeListHead, expected, next);
+                intr::atomic::CAS_acq_rel(&freeListHead, expected, next);
             }
             // update nexts prev
             if(next != NULL_ADDR)
@@ -589,7 +536,7 @@ class SlabArena {
             return proxies.arena[slabIndex];
         }
 
-        // round-robin :) + res
+
         __host__ __device__
         slabAddrType alloc(size_t objectSize = 0){
             if(objectSize == 0)
@@ -598,11 +545,8 @@ class SlabArena {
             // look for slabs of size sz
             for(size_t i = 0; i < SLAB_COUNT; i++){
                 slabProxyType& proxy = proxies.arena[i].data;
-                if(proxy.getSize() == objectSize && proxy.isAvailable() && !proxy.isFull()){
-                    uint32_t state = intr::atomic::load_relaxed(&proxy.reservationState);
-                    if(state == slabProxyType::PARTIAL && !proxy.isFull()) 
-                        return static_cast<slabAddrType>(i);
-                }
+                if(proxy.getSize() == objectSize && proxy.isAvailable())
+                    return static_cast<slabAddrType>(i);
             }
 
             // try free slab from the free list
@@ -635,6 +579,7 @@ class SlabArena {
             
             return NULL_ADDR;
         } // end of alloc
+        
 
         __host__ __device__
         bool free(slabAddrType slabAddr){

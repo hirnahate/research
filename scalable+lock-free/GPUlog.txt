@@ -1,0 +1,56 @@
+GPU Allocator Testing
+=====================
+
+Using GPU: NVIDIA A30
+Compute Capability: 8.0
+Max Threads per Block: 1024
+Multiprocessors: 56
+
+=== GPU Allocator Test ===
+Launching 4096 GPU threads...
+
+GPU Results:
+Duration: 1543ms
+Threads: 4096
+Allocs: 1232894
+Frees: 1232832
+Failures: 408498
+Leaks: 62
+Throughput: 1598007 ops/sec
+Success rate: 85.7875%
+:( 62 leaks detected!
+
+=== GPU Stress Test ===
+Launching 16384 threads for stress test...
+
+GPU Stress Results:
+Duration: 3000ms
+Total Threads: 16384
+Allocs: 726746
+Frees: 726746
+Failures: 41951
+Leaks: 0
+Throughput: 484497 ops/sec
+:) No leaks under extreme GPU contention
+
+=== CPU vs GPU Comparison ===
+CPU Results:
+Duration: 322ms
+Successful Allocs: 1000
+CPU Throughput: 6211 ops/sec
+
+=== GPU Allocator Test ===
+Launching 4096 GPU threads...
+
+GPU Results:
+Duration: 1273ms
+Threads: 4096
+Allocs: 1223193
+Frees: 1223135
+Failures: 411101
+Leaks: 58
+Throughput: 1921703 ops/sec
+Success rate: 85.6129%
+:( 58 leaks detected!
+
+All GPU tests completed!

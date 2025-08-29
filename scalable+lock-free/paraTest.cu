@@ -9,17 +9,14 @@
 #include "log.h"
 #include "allocator.h"
 
-// lets make better error codes
 
 // global tracker for allocations/frees using an atomic bitmask
 template <typename SIZE_TYPE>
 class ParallelTracker {
 public:
-    //static constexpr size_t PER_SLAB_STRIDE = 512;
     static constexpr size_t MAX_TRACKED_OBJECTS = TestSlabArena::SLAB_COUNT * 1024;
+
 private:
-    // each entry: [31:16] = size, [15:0] = thread_id, 0 = free
-    // std::atomic<uint32_t> trackingArena[MAX_TRACKED_OBJECTS];
     std::unique_ptr<uint32_t[]> trackingArena;
     size_t currentByteTotal   = 0;
     size_t minimumRefusalTotal = MAX_TRACKED_OBJECTS * 8;
@@ -67,23 +64,26 @@ public:
         auto slabInd = arena.slabIndexFor(ptr);
         if(slabInd >= TestSlabArena::SLAB_COUNT)
             return MAX_TRACKED_OBJECTS;
-
-        // find beginning - skip mask
-        auto& slab = arena.slabAt(slabInd);
-        char* slabStart = static_cast<char*>(static_cast<void*>(&slab));
-        char* ptrChar = static_cast<char*>(ptr);
-
-        size_t offset = ptrChar - slabStart;
-
-        // find size and mask layout
+        
         auto& proxy = arena.proxyAt(slabInd).data;
         size_t objectSz = proxy.getSize();
 
         if(objectSz == 0)
             return MAX_TRACKED_OBJECTS;
         
-        // find mask overhead
+        // find capacity for slab
         size_t maxObj = proxy.slabObjCount(objectSz);
+        if(maxObj == 0)
+            return MAX_TRACKED_OBJECTS;
+
+        // find beginning - skip mask
+        auto& slab = arena.slabAt(slabInd);
+        char* slabStart = static_cast<char*>(static_cast<void*>(&slab));
+        char* ptrChar = static_cast<char*>(ptr);
+        size_t offset = ptrChar - slabStart;
+
+        
+        // find mask overhead
         size_t maskElemCount = (maxObj + proxy.SLAB_ELEM_BIT_SIZE - 1) / proxy.SLAB_ELEM_BIT_SIZE;
         size_t maskOverhead = maskElemCount * sizeof(typename TestSlabArena::slabProxyType::allocMaskElem);
 
@@ -99,18 +99,35 @@ public:
         if(objectInd >= maxObj)
             return MAX_TRACKED_OBJECTS;
 
-        size_t objectsPerSlab = proxy.slabObjCount(objectSz);
-        size_t globalInd = slabInd * objectsPerSlab + objectInd;
+        // calc total global ind
+        size_t globalInd = 0;
+        for(size_t i = 0; i < slabInd; i++){
+            auto& prevProxy = arena.proxyAt(i).data;
+            size_t prevSize = prevProxy.getSize();
+
+            if(prevSize > 0){
+                size_t prevCap = prevProxy.slabObjCount(prevSize);
+                globalInd += prevCap;
+            } else {
+                // for unallocated slabs -> safe estimate
+                globalInd += 256;
+            }
+
+            if(globalInd >= MAX_TRACKED_OBJECTS)
+                return MAX_TRACKED_OBJECTS;
+        }
         
-        return globalInd;
+        globalInd += objectInd;
+
+        
+        return (globalInd < MAX_TRACKED_OBJECTS) ? globalInd : MAX_TRACKED_OBJECTS;
     }
     
     // log an allocation with CAS
     bool recordAllocation(void* ptr, size_t size, uint16_t threadId, TestSlabArena& arena) {
         size_t index = getIndexForPtr(ptr, arena);
-        printf("TRACKING  :  ptr=%p -> index=%zu (max=%zu)\n", ptr, index, MAX_TRACKED_OBJECTS);
         if (index >= MAX_TRACKED_OBJECTS) {
-            Log() << "Failed: Allocation index for size "<< size 
+            Log() << ":( - Failed: Allocation index for size "<< size 
                   << " at " << ptr <<" exceeds arena bounds!" << std::endl;
             return false;
         }
@@ -127,16 +144,16 @@ public:
 
         uint32_t bad_size = (expected>>16) & 0xFFFF;
         uint32_t bad_id   = expected & 0xFFFF;
-        Log() << "Failed to allocate size " << size << ". Expected 0, but found ("<<bad_size<<","<<bad_id<<")" << std::endl;
+        Log() << ":( - Failed to allocate size " << size << ". Expected 0, but found ("<<bad_size<<","<<bad_id<<")" << std::endl;
         intr::atomic::add_system(&totalFailures, size_t{1});
         return false;
     }
 
-    
-    // log a free with CAS
+
     bool recordFree(void* ptr, uint16_t threadId, TestSlabArena& arena) {
         size_t index = getIndexForPtr(ptr, arena);
-        if (index >= MAX_TRACKED_OBJECTS) return false;
+        if (index >= MAX_TRACKED_OBJECTS) 
+            return false;
         
         uint32_t current = intr::atomic::load_acquire(&trackingArena[index]);
         
@@ -212,13 +229,12 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
         int action = actionDist(gen);
         
         // 70% chance to alloc, 30% chance to free
-        if (action < 70 || localAllocations.empty()) {
+        if (action < 55 || localAllocations.empty()) {
             // try alloc
             size_t objSize = 1 << sizeDist(gen);
             TestAllocator allocator(arena, objSize);
             
             void* ptr = allocator.alloc();
-            Log() << "Allocated size " << objSize << " at " << ptr << std::endl;
             if (ptr) {
                 if (tracker.recordAllocation(ptr, objSize, threadId, arena)) {
                     localAllocations.push_back({ptr, objSize});
@@ -231,7 +247,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
                     }
                 } else {
                     // tracker failed, free it back right away
-                    Log() << "Failed to record allocation of size " << objSize << " at " << ptr << std::endl;
+                    Log() << ":( - Failed to record allocation of size " << objSize << " at " << ptr << std::endl;
                     TestAllocator freeAllocator(arena, objSize);
                     freeAllocator.free(ptr);
                     localTrackerFails++;
@@ -240,7 +256,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
                 size_t total = tracker.getCurrentByteTotal();
                 tracker.logRefusalAtTotal(total);
                 float proportion = ((float)total) / (ParallelTracker<SIZE_TYPE>::MAX_TRACKED_OBJECTS*8.0f);
-                Log() << "Failed to  allocate object of size " << objSize << " with "
+                Log() << ":( - Failed to  allocate object of size " << objSize << " with "
                       << (100.0*(1.0-proportion)) << "% capacity left"<<  std::endl;
             }
         } else {
@@ -250,7 +266,6 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
                 size_t index = indexDist(gen);
                 
                 void* ptr = localAllocations[index].first;
-                Log() << "Deallocating at " << ptr << std::endl;
                 size_t objSize = localAllocations[index].second;
                 
                 // sanity check data
@@ -258,7 +273,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
                     uint32_t* intPtr = static_cast<uint32_t*>(ptr);
                     if ((*intPtr >> 16) != threadId) {
                         localDataCorruption++;
-                        std::cout << "Thread " << threadId << ": data corruption detected!" << std::endl;
+                        std::cout << ":( - Thread " << threadId << ": data corruption detected!" << std::endl;
                     }
                 }
                 
@@ -268,7 +283,7 @@ void workerThread(TestSlabArena& arena, ParallelTracker<SIZE_TYPE>& tracker,
                         localFrees++;
                     } else {
                         localTrackerFails++;
-                        Log() << "Failed to record deallocation of size " << objSize << " at " << ptr << std::endl;
+                        Log() << ":( - Failed to record deallocation of size " << objSize << " at " << ptr << std::endl;
                     }
                 } else {
                     localFreeFails++;

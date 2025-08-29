@@ -2,10 +2,20 @@
 #include <device_launch_parameters.h>
 #include <iostream>
 #include <chrono>
+#include <sstream>
 //#include <thread>
 
 #include "intr/mod.h"
 #include "allocator.h"
+
+void auto_throw(cudaError_t result) {
+    if(result != cudaSuccess) {
+        std::stringstream ss;
+        ss << ":( - CUDA error: " << cudaGetErrorString(result) << std::endl;
+    throw std::runtime_error(ss.str());
+    }
+}
+
 
 __device__ 
 uint32_t simpleRand(uint32_t* seed){
@@ -133,6 +143,7 @@ void allocatorTestKernel(TestSlabArena* arena, GPUTracker* tracker, int iteratio
     // local allocation tracking
     void* localPtrs[64];        // Reduced for GPU stack limits
     size_t localSizes[64];
+    uint32_t localIds[64];
     int localCount = 0;
     
     for(int i = 0; i < iterations && !(*shouldStop); i++) {
@@ -148,14 +159,17 @@ void allocatorTestKernel(TestSlabArena* arena, GPUTracker* tracker, int iteratio
             
             if(ptr && localCount < 64) {
                 if(tracker->recordAllocation(ptr, objSize, tid, arena)) {
-                    localPtrs[localCount] = ptr;
+                    uint32_t vid = simpleRand(&seed) % 0xFFFFu;
+                    localPtrs[localCount]  = ptr;
                     localSizes[localCount] = objSize;
+                    localIds[localCount]   = vid;
                     localCount++;
                     
                     // write test pattern
                     if(objSize >= 4) {
                         uint32_t* intPtr = static_cast<uint32_t*>(ptr);
-                        *intPtr = (tid << 16) | (i & 0xFFFF);
+            uint32_t new_val = (tid << 16) | (vid & 0xFFFF);
+            uint32_t old_val = intr::atomic::exch_system(intPtr,new_val);
                     }
                 } else {
                     // tracking failed, free immediately
@@ -169,13 +183,18 @@ void allocatorTestKernel(TestSlabArena* arena, GPUTracker* tracker, int iteratio
                 uint32_t idx = simpleRand(&seed) % localCount;
                 void* ptr = localPtrs[idx];
                 size_t objSize = localSizes[idx];
+                uint32_t vid = localIds[idx];
                 
+        __threadfence_system();
                 // check test pattern
                 if(objSize >= 4) {
                     uint32_t* intPtr = static_cast<uint32_t*>(ptr);
-                    uint32_t expected = (tid << 16) | ((i - (localCount - idx)) & 0xFFFF);
-                    if(*intPtr != expected) {
-                        printf(":( - GPU Thread %u: Data corruption detected!\n", tid);
+                    uint32_t expected = (tid << 16) | (vid & 0xFFFF);
+            uint32_t old_val = intr::atomic::CAS_system((unsigned int*)intPtr,(unsigned int)expected,0u);
+            uint32_t old_tid = (old_val >> 16 & 0xFFFF);
+            uint32_t old_vid = (old_val & 0xFFFF);
+                    if(old_val != expected) {
+                        printf(":( - GPU Thread %u: Data corruption detected! Expected (%d,%d), but found (%d,%d).\n", tid,tid,vid,old_tid,old_vid);
                     }
                 }
                 
@@ -187,6 +206,7 @@ void allocatorTestKernel(TestSlabArena* arena, GPUTracker* tracker, int iteratio
                 // remove from local array (swap with last)
                 localPtrs[idx] = localPtrs[localCount-1];
                 localSizes[idx] = localSizes[localCount-1];
+                localIds[idx] = localIds[localCount-1];
                 localCount--;
             }
         }
@@ -260,7 +280,7 @@ void runGPUAllocatorTest() {
     }
     
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
     
     // Get results back to host
     uint32_t h_stats[4];
@@ -276,6 +296,7 @@ void runGPUAllocatorTest() {
         if(h_trackingArena[i] != 0) leaks++;
     }
     
+    float conversion = 1000000000.0;
     // Print results
     std::cout << "\nGPU Results:" << std::endl;
     std::cout << "Duration: " << duration.count() << "ms" << std::endl;
@@ -284,7 +305,8 @@ void runGPUAllocatorTest() {
     std::cout << "Frees: " << h_stats[1] << std::endl;
     std::cout << "Failures: " << h_stats[2] << std::endl;
     std::cout << "Leaks: " << leaks << std::endl;
-    std::cout << "Throughput: " << ((h_stats[0] + h_stats[1]) * 1000) / duration.count() << " ops/sec" << std::endl;
+    std::cout << "Duration is: "<<duration.count() << std::endl;
+    std::cout << "Throughput: " << ((h_stats[0] + h_stats[1]) * conversion) / duration.count() << " ops/sec" << std::endl;
     
     uint32_t totalOps = h_stats[0] + h_stats[1] + h_stats[2];
     if(totalOps > 0) {
@@ -317,7 +339,8 @@ void stressTestKernel(TestSlabArena* arena, GPUTracker* tracker, int maxIteratio
     void* localPtrs[32];  // smaller for stress test
     size_t localSizes[32];
     int localCount = 0;
-    
+ 
+    printf("\n\nEXECUTING!\n\n");
     for(int i = 0; i < maxIterations; i++) {
         // check stop condition every 100 iterations
         if(i % 100 == 0 && *shouldStop) 
@@ -430,20 +453,20 @@ void runGPUStressTest() {
         if(elapsed.count() >= 3) break;
     }    
     stopFlag = 1;
-    cudaMemcpy(d_shouldStop, &stopFlag, sizeof(uint32_t), cudaMemcpyHostToDevice);
+    auto_throw(cudaMemcpy(d_shouldStop, &stopFlag, sizeof(uint32_t), cudaMemcpyHostToDevice));
     
-    cudaDeviceSynchronize();
+    auto_throw(cudaDeviceSynchronize());
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     
     // Get results
     uint32_t h_stats[4];
-    cudaMemcpy(h_stats, d_stats, 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    auto_throw(cudaMemcpy(h_stats, d_stats, 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     
     uint32_t* h_trackingArena = new uint32_t[GPUTracker::MAX_TRACKED_OBJECTS];
-    cudaMemcpy(h_trackingArena, d_trackingArena, 
-               GPUTracker::MAX_TRACKED_OBJECTS * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    auto_throw(cudaMemcpy(h_trackingArena, d_trackingArena, 
+               GPUTracker::MAX_TRACKED_OBJECTS * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     
     uint32_t leaks = 0;
     for(size_t i = 0; i < GPUTracker::MAX_TRACKED_OBJECTS; i++) {
